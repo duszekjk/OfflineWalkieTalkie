@@ -16,7 +16,11 @@ struct ContentView: View {
                     Text(output.rawValue).tag(output)
                 }
             }
-            .pickerStyle(.menu)
+            .pickerStyle(.segmented)
+
+            Text(walkieTalkie.currentAudioRoute)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
 
             Circle()
                 .fill(walkieTalkie.isTalking ? Color.red : Color.blue)
@@ -41,7 +45,7 @@ struct ContentView: View {
                         }
                 )
 
-            Text("Pierwsza faza: bezpośrednie audio PCM przez lokalne połączenie peer-to-peer.")
+            Text("Tryb systemowy korzysta z aktualnie wybranego wyjścia iOS, w tym zestawu samochodowego lub Bluetooth.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
