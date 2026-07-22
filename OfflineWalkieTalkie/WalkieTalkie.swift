@@ -34,6 +34,7 @@ final class WalkieTalkie: ObservableObject {
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connection: NWConnection?
+    private var peerEndpoint: NWEndpoint?
     private var receivedData = Data()
     private var connected = false
     private var microphoneReady = false
@@ -42,9 +43,17 @@ final class WalkieTalkie: ObservableObject {
     private var silentSamples = 0
     private var sendingVoice = false
     private var sequence: UInt32 = 0
+    private var lastReceived = Date()
+    private var reconnectTimer: Timer?
     private let peerName = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+    private let parameters: NWParameters
 
     init() {
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        parameters = NWParameters(tls: nil, tcp: tcpOptions)
+        parameters.includePeerToPeer = true
+
         audioEngine.attach(player)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playbackFormat)
         player.volume = 1
@@ -80,11 +89,6 @@ final class WalkieTalkie: ObservableObject {
             }
         }
 
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.noDelay = true
-        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
-        parameters.includePeerToPeer = true
-
         do {
             listener = try NWListener(using: parameters)
             listener?.service = NWListener.Service(name: peerName, type: "_offlinewalkie._tcp")
@@ -100,16 +104,64 @@ final class WalkieTalkie: ObservableObject {
 
         browser = NWBrowser(for: .bonjour(type: "_offlinewalkie._tcp", domain: nil), using: parameters)
         browser?.browseResultsChangedHandler = { [weak self] results, _ in
-            guard let self, self.connection == nil else { return }
+            guard let self else { return }
 
+            self.peerEndpoint = nil
             for result in results {
                 if case let .service(name, _, _, _) = result.endpoint, self.peerName < name {
-                    self.use(NWConnection(to: result.endpoint, using: parameters))
+                    self.peerEndpoint = result.endpoint
+                    if self.connection == nil {
+                        self.use(NWConnection(to: result.endpoint, using: self.parameters))
+                    }
                     break
                 }
             }
         }
         browser?.start(queue: .main)
+
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+
+            if self.connected {
+                if Date().timeIntervalSince(self.lastReceived) > 4 {
+                    self.resetConnection()
+                    return
+                }
+
+                var body = Data([2])
+                var packetSequence = self.sequence.bigEndian
+                self.sequence &+= 1
+                body.append(Data(bytes: &packetSequence, count: 4))
+                var length = UInt16(body.count).bigEndian
+                var packet = Data(bytes: &length, count: 2)
+                packet.append(body)
+                self.connection?.send(content: packet, completion: .contentProcessed { [weak self] error in
+                    if error != nil {
+                        DispatchQueue.main.async {
+                            self?.resetConnection()
+                        }
+                    }
+                })
+            } else if self.connection == nil, let peerEndpoint = self.peerEndpoint {
+                self.use(NWConnection(to: peerEndpoint, using: self.parameters))
+            }
+        }
+    }
+
+    deinit {
+        reconnectTimer?.invalidate()
+    }
+
+    private func resetConnection() {
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+        connected = false
+        receivedData.removeAll(keepingCapacity: true)
+        queuedBuffers = 0
+        player.stop()
+        player.play()
+        status = "Szukam drugiego urządzenia…"
     }
 
     private func use(_ newConnection: NWConnection) {
@@ -119,20 +171,20 @@ final class WalkieTalkie: ObservableObject {
         }
 
         connection = newConnection
-        newConnection.stateUpdateHandler = { [weak self] state in
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             DispatchQueue.main.async {
+                guard let self, let newConnection, self.connection === newConnection else { return }
+
                 switch state {
                 case .ready:
-                    self?.connected = true
-                    self?.status = "Połączono — ramki 5 ms"
+                    self.connected = true
+                    self.lastReceived = Date()
+                    self.status = "Połączono — ramki 5 ms"
                 case .failed(let error):
-                    self?.connected = false
-                    self?.status = "Rozłączono: \(error.localizedDescription)"
-                    self?.connection = nil
+                    self.status = "Rozłączono: \(error.localizedDescription)"
+                    self.resetConnection()
                 case .cancelled:
-                    self?.connected = false
-                    self?.status = "Szukam drugiego urządzenia…"
-                    self?.connection = nil
+                    self.resetConnection()
                 default:
                     break
                 }
@@ -141,10 +193,11 @@ final class WalkieTalkie: ObservableObject {
         newConnection.start(queue: .main)
 
         func receive() {
-            newConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
-                guard let self else { return }
+            newConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak newConnection] data, _, complete, error in
+                guard let self, let newConnection, self.connection === newConnection else { return }
 
                 if let data {
+                    self.lastReceived = Date()
                     self.receivedData.append(data)
 
                     while self.receivedData.count >= 2 {
@@ -155,10 +208,17 @@ final class WalkieTalkie: ObservableObject {
                         self.receivedData.removeSubrange(0..<(2 + Int(length)))
                         guard packet.count >= 5 else { continue }
 
-                        if packet[packet.startIndex] == 1 {
+                        let type = packet[packet.startIndex]
+                        if type == 2 {
+                            continue
+                        }
+                        if type == 1 {
                             self.player.stop()
                             self.queuedBuffers = 0
                             self.player.play()
+                            continue
+                        }
+                        if self.queuedBuffers >= 12 {
                             continue
                         }
 
@@ -191,11 +251,7 @@ final class WalkieTalkie: ObservableObject {
                             outputSamples[index] = tanh(outputSamples[index] * gain * 1.3)
                         }
 
-                        if self.queuedBuffers >= 4 {
-                            self.player.stop()
-                            self.queuedBuffers = 0
-                            self.player.play()
-                        } else if !self.player.isPlaying {
+                        if !self.player.isPlaying {
                             self.player.play()
                         }
 
@@ -214,9 +270,8 @@ final class WalkieTalkie: ObservableObject {
 
                 if complete || error != nil {
                     DispatchQueue.main.async {
-                        self.connected = false
-                        self.connection = nil
-                        self.status = "Szukam drugiego urządzenia…"
+                        guard self.connection === newConnection else { return }
+                        self.resetConnection()
                     }
                 } else {
                     receive()
@@ -265,8 +320,8 @@ final class WalkieTalkie: ObservableObject {
         }
 
         converter.sampleRateConverterQuality = 16
-        input.installTap(onBus: 0, bufferSize: 240, format: inputFormat) { [weak self] buffer, _ in
-            guard let self else { return }
+        input.installTap(onBus: 0, bufferSize: 240, format: inputFormat) { [weak self, weak connection] buffer, _ in
+            guard let self, let connection, self.connection === connection else { return }
 
             let capacity = AVAudioFrameCount(
                 (Double(buffer.frameLength) * self.networkFormat.sampleRate / inputFormat.sampleRate).rounded(.up)
@@ -329,7 +384,13 @@ final class WalkieTalkie: ObservableObject {
             var length = UInt16(body.count).bigEndian
             var packet = Data(bytes: &length, count: 2)
             packet.append(body)
-            connection.send(content: packet, completion: .contentProcessed { _ in })
+            connection.send(content: packet, completion: .contentProcessed { [weak self] error in
+                if error != nil {
+                    DispatchQueue.main.async {
+                        self?.resetConnection()
+                    }
+                }
+            })
         }
         tapInstalled = true
     }
