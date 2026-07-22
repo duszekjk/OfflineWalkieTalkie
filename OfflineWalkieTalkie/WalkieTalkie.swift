@@ -3,7 +3,7 @@ import Network
 import UIKit
 
 final class WalkieTalkie: ObservableObject {
-    @Published var status = "Szukam drugiego iPhone’a…"
+    @Published var status = "Szukam drugiego urządzenia…"
     @Published var isTalking = false {
         didSet {
             if isTalking {
@@ -34,6 +34,7 @@ final class WalkieTalkie: ObservableObject {
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connection: NWConnection?
+    private var receivedData = Data()
     private var connected = false
     private var microphoneReady = false
     private var tapInstalled = false
@@ -73,18 +74,20 @@ final class WalkieTalkie: ObservableObject {
                     try self.audioEngine.start()
                     self.player.play()
                     self.microphoneReady = true
-                    self.status = "Audio gotowe — bufor \(Int(session.ioBufferDuration * 1000)) ms"
                 } catch {
                     self.status = "Błąd audio: \(error.localizedDescription)"
                 }
             }
         }
 
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
+        parameters.includePeerToPeer = true
+
         do {
-            let parameters = NWParameters.udp
-            parameters.includePeerToPeer = true
             listener = try NWListener(using: parameters)
-            listener?.service = NWListener.Service(name: peerName, type: "_offlinewalkie._udp")
+            listener?.service = NWListener.Service(name: peerName, type: "_offlinewalkie._tcp")
             listener?.newConnectionHandler = { [weak self] newConnection in
                 DispatchQueue.main.async {
                     self?.use(newConnection)
@@ -95,9 +98,7 @@ final class WalkieTalkie: ObservableObject {
             status = "Błąd nasłuchiwania: \(error.localizedDescription)"
         }
 
-        let parameters = NWParameters.udp
-        parameters.includePeerToPeer = true
-        browser = NWBrowser(for: .bonjour(type: "_offlinewalkie._udp", domain: nil), using: parameters)
+        browser = NWBrowser(for: .bonjour(type: "_offlinewalkie._tcp", domain: nil), using: parameters)
         browser?.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self, self.connection == nil else { return }
 
@@ -123,14 +124,14 @@ final class WalkieTalkie: ObservableObject {
                 switch state {
                 case .ready:
                     self?.connected = true
-                    self?.status = "Połączono — UDP, ramki 5 ms"
+                    self?.status = "Połączono — ramki 5 ms"
                 case .failed(let error):
                     self?.connected = false
                     self?.status = "Rozłączono: \(error.localizedDescription)"
                     self?.connection = nil
                 case .cancelled:
                     self?.connected = false
-                    self?.status = "Szukam drugiego iPhone’a…"
+                    self?.status = "Szukam drugiego urządzenia…"
                     self?.connection = nil
                 default:
                     break
@@ -140,73 +141,82 @@ final class WalkieTalkie: ObservableObject {
         newConnection.start(queue: .main)
 
         func receive() {
-            newConnection.receiveMessage { [weak self] data, _, _, error in
+            newConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
                 guard let self else { return }
 
-                if let data, data.count >= 5 {
-                    let type = data[data.startIndex]
+                if let data {
+                    self.receivedData.append(data)
 
-                    if type == 1 {
-                        self.player.stop()
-                        self.queuedBuffers = 0
-                        self.player.play()
-                    } else if type == 0 {
-                        let audio = data.dropFirst(5)
+                    while self.receivedData.count >= 2 {
+                        let length = self.receivedData.prefix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
+                        guard self.receivedData.count >= 2 + Int(length) else { break }
+
+                        let packet = self.receivedData.subdata(in: 2..<(2 + Int(length)))
+                        self.receivedData.removeSubrange(0..<(2 + Int(length)))
+                        guard packet.count >= 5 else { continue }
+
+                        if packet[packet.startIndex] == 1 {
+                            self.player.stop()
+                            self.queuedBuffers = 0
+                            self.player.play()
+                            continue
+                        }
+
+                        let audio = packet.dropFirst(5)
                         let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
+                        guard frameCount > 0,
+                              let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: frameCount),
+                              let inputSamples = inputBuffer.int16ChannelData?[0],
+                              let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
+                              let outputSamples = outputBuffer.floatChannelData?[0]
+                        else { continue }
 
-                        if frameCount > 0,
-                           let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: frameCount),
-                           let inputSamples = inputBuffer.int16ChannelData?[0],
-                           let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
-                           let outputSamples = outputBuffer.floatChannelData?[0] {
-                            inputBuffer.frameLength = frameCount
-                            outputBuffer.frameLength = frameCount
-                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(
-                                start: inputSamples,
-                                count: Int(frameCount) * MemoryLayout<Int16>.size
-                            ))
+                        inputBuffer.frameLength = frameCount
+                        outputBuffer.frameLength = frameCount
+                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(
+                            start: inputSamples,
+                            count: Int(frameCount) * MemoryLayout<Int16>.size
+                        ))
 
-                            var squareSum: Float = 0
-                            for index in 0..<Int(frameCount) {
-                                let sample = Float(inputSamples[index]) / Float(Int16.max)
-                                outputSamples[index] = sample
-                                squareSum += sample * sample
-                            }
+                        var squareSum: Float = 0
+                        for index in 0..<Int(frameCount) {
+                            let sample = Float(inputSamples[index]) / Float(Int16.max)
+                            outputSamples[index] = sample
+                            squareSum += sample * sample
+                        }
 
-                            let rms = sqrt(squareSum / Float(frameCount))
-                            let gain = rms > 0.0001 ? min(60, max(3, 0.4 / rms)) : 1
-                            for index in 0..<Int(frameCount) {
-                                outputSamples[index] = tanh(outputSamples[index] * gain * 1.25)
-                            }
+                        let rms = sqrt(squareSum / Float(frameCount))
+                        let gain = rms > 0.0001 ? min(65, max(3.5, 0.44 / rms)) : 1
+                        for index in 0..<Int(frameCount) {
+                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.3)
+                        }
 
-                            if self.queuedBuffers >= 4 {
-                                self.player.stop()
-                                self.queuedBuffers = 0
-                                self.player.play()
-                            }
-                            if !self.player.isPlaying {
-                                self.player.play()
-                            }
+                        if self.queuedBuffers >= 4 {
+                            self.player.stop()
+                            self.queuedBuffers = 0
+                            self.player.play()
+                        } else if !self.player.isPlaying {
+                            self.player.play()
+                        }
 
-                            self.queuedBuffers += 1
-                            self.player.scheduleBuffer(
-                                outputBuffer,
-                                completionCallbackType: .dataPlayedBack
-                            ) { [weak self] _ in
-                                DispatchQueue.main.async {
-                                    guard let self else { return }
-                                    self.queuedBuffers = max(0, self.queuedBuffers - 1)
-                                }
+                        self.queuedBuffers += 1
+                        self.player.scheduleBuffer(
+                            outputBuffer,
+                            completionCallbackType: .dataPlayedBack
+                        ) { [weak self] _ in
+                            DispatchQueue.main.async {
+                                guard let self else { return }
+                                self.queuedBuffers = max(0, self.queuedBuffers - 1)
                             }
                         }
                     }
                 }
 
-                if error != nil {
+                if complete || error != nil {
                     DispatchQueue.main.async {
                         self.connected = false
                         self.connection = nil
-                        self.status = "Szukam drugiego iPhone’a…"
+                        self.status = "Szukam drugiego urządzenia…"
                     }
                 } else {
                     receive()
@@ -219,6 +229,7 @@ final class WalkieTalkie: ObservableObject {
 
     private func startTalking() {
         guard let connection, connected else {
+            status = "Brak połączenia z drugim urządzeniem"
             isTalking = false
             return
         }
@@ -260,10 +271,7 @@ final class WalkieTalkie: ObservableObject {
             let capacity = AVAudioFrameCount(
                 (Double(buffer.frameLength) * self.networkFormat.sampleRate / inputFormat.sampleRate).rounded(.up)
             ) + 8
-            guard let converted = AVAudioPCMBuffer(
-                pcmFormat: self.networkFormat,
-                frameCapacity: capacity
-            ) else { return }
+            guard let converted = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: capacity) else { return }
 
             var supplied = false
             var conversionError: NSError?
@@ -297,14 +305,12 @@ final class WalkieTalkie: ObservableObject {
                     self.sendingVoice = false
                     var packetSequence = self.sequence.bigEndian
                     self.sequence &+= 1
-                    var resetPacket = Data([1])
-                    resetPacket.append(Data(bytes: &packetSequence, count: 4))
-                    connection.send(
-                        content: resetPacket,
-                        contentContext: .defaultMessage,
-                        isComplete: true,
-                        completion: .contentProcessed { _ in }
-                    )
+                    var body = Data([1])
+                    body.append(Data(bytes: &packetSequence, count: 4))
+                    var length = UInt16(body.count).bigEndian
+                    var packet = Data(bytes: &length, count: 2)
+                    packet.append(body)
+                    connection.send(content: packet, completion: .contentProcessed { _ in })
                 }
                 return
             }
@@ -314,19 +320,16 @@ final class WalkieTalkie: ObservableObject {
 
             var packetSequence = self.sequence.bigEndian
             self.sequence &+= 1
-            var packet = Data([0])
-            packet.append(Data(bytes: &packetSequence, count: 4))
-            packet.append(Data(
+            var body = Data([0])
+            body.append(Data(bytes: &packetSequence, count: 4))
+            body.append(Data(
                 bytes: samples,
                 count: Int(converted.frameLength) * MemoryLayout<Int16>.size
             ))
-
-            connection.send(
-                content: packet,
-                contentContext: .defaultMessage,
-                isComplete: true,
-                completion: .contentProcessed { _ in }
-            )
+            var length = UInt16(body.count).bigEndian
+            var packet = Data(bytes: &length, count: 2)
+            packet.append(body)
+            connection.send(content: packet, completion: .contentProcessed { _ in })
         }
         tapInstalled = true
     }
