@@ -62,7 +62,7 @@ final class WalkieTalkie: ObservableObject {
                     try session.setCategory(
                         .playAndRecord,
                         mode: .videoChat,
-                        options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+                        options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
                     )
                     try session.setPreferredSampleRate(48_000)
                     try session.setPreferredIOBufferDuration(0.005)
@@ -96,12 +96,12 @@ final class WalkieTalkie: ObservableObject {
         browser?.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self else { return }
 
-            peerEndpoint = nil
+            self.peerEndpoint = nil
             for result in results {
-                if case let .service(name, _, _, _) = result.endpoint, peerName < name {
-                    peerEndpoint = result.endpoint
-                    if connection == nil {
-                        use(NWConnection(to: result.endpoint, using: parameters))
+                if case let .service(name, _, _, _) = result.endpoint, self.peerName < name {
+                    self.peerEndpoint = result.endpoint
+                    if self.connection == nil {
+                        self.use(NWConnection(to: result.endpoint, using: self.parameters))
                     }
                     break
                 }
@@ -112,28 +112,28 @@ final class WalkieTalkie: ObservableObject {
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
 
-            if connected {
-                if Date().timeIntervalSince(lastReceived) > 4 {
-                    resetConnection()
+            if self.connected {
+                if Date().timeIntervalSince(self.lastReceived) > 4 {
+                    self.resetConnection()
                     return
                 }
 
                 var body = Data([2])
-                var packetSequence = sequence.bigEndian
-                sequence &+= 1
+                var packetSequence = self.sequence.bigEndian
+                self.sequence &+= 1
                 body.append(Data(bytes: &packetSequence, count: 4))
                 var length = UInt16(body.count).bigEndian
                 var packet = Data(bytes: &length, count: 2)
                 packet.append(body)
-                connection?.send(content: packet, completion: .contentProcessed { [weak self] error in
+                self.connection?.send(content: packet, completion: .contentProcessed { [weak self] error in
                     if error != nil {
                         DispatchQueue.main.async {
                             self?.resetConnection()
                         }
                     }
                 })
-            } else if connection == nil, let peerEndpoint {
-                use(NWConnection(to: peerEndpoint, using: parameters))
+            } else if self.connection == nil, let peerEndpoint = self.peerEndpoint {
+                self.use(NWConnection(to: peerEndpoint, using: self.parameters))
             }
         }
     }
@@ -162,18 +162,18 @@ final class WalkieTalkie: ObservableObject {
         connection = newConnection
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             DispatchQueue.main.async {
-                guard let self, let newConnection, connection === newConnection else { return }
+                guard let self, let newConnection, self.connection === newConnection else { return }
 
                 switch state {
                 case .ready:
-                    connected = true
-                    lastReceived = Date()
-                    status = "Połączono — 16 kHz"
+                    self.connected = true
+                    self.lastReceived = Date()
+                    self.status = "Połączono — 16 kHz"
                 case .failed(let error):
-                    status = "Rozłączono: \(error.localizedDescription)"
-                    resetConnection()
+                    self.status = "Rozłączono: \(error.localizedDescription)"
+                    self.resetConnection()
                 case .cancelled:
-                    resetConnection()
+                    self.resetConnection()
                 default:
                     break
                 }
@@ -183,25 +183,25 @@ final class WalkieTalkie: ObservableObject {
 
         func receive() {
             newConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak newConnection] data, _, complete, error in
-                guard let self, let newConnection, connection === newConnection else { return }
+                guard let self, let newConnection, self.connection === newConnection else { return }
 
                 if let data {
-                    lastReceived = Date()
-                    receivedData.append(data)
+                    self.lastReceived = Date()
+                    self.receivedData.append(data)
 
-                    while receivedData.count >= 2 {
-                        let length = receivedData.prefix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
-                        guard receivedData.count >= 2 + Int(length) else { break }
+                    while self.receivedData.count >= 2 {
+                        let length = self.receivedData.prefix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
+                        guard self.receivedData.count >= 2 + Int(length) else { break }
 
-                        let packet = receivedData.subdata(in: 2..<(2 + Int(length)))
-                        receivedData.removeSubrange(0..<(2 + Int(length)))
+                        let packet = self.receivedData.subdata(in: 2..<(2 + Int(length)))
+                        self.receivedData.removeSubrange(0..<(2 + Int(length)))
                         guard packet.count >= 5 else { continue }
                         if packet[packet.startIndex] == 2 { continue }
 
                         let audio = packet.dropFirst(5)
                         let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
                         guard frameCount > 0,
-                              let buffer = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: frameCount),
+                              let buffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
                               let output = buffer.floatChannelData?[0]
                         else { continue }
 
@@ -222,17 +222,17 @@ final class WalkieTalkie: ObservableObject {
                             }
                         }
 
-                        if !player.isPlaying {
-                            player.play()
+                        if !self.player.isPlaying {
+                            self.player.play()
                         }
-                        player.scheduleBuffer(buffer)
+                        self.player.scheduleBuffer(buffer)
                     }
                 }
 
                 if complete || error != nil {
                     DispatchQueue.main.async {
-                        guard connection === newConnection else { return }
-                        resetConnection()
+                        guard self.connection === newConnection else { return }
+                        self.resetConnection()
                     }
                 } else {
                     receive()
@@ -277,7 +277,6 @@ final class WalkieTalkie: ObservableObject {
             return
         }
 
-        // 20 ms at the native input rate. The network payload is always 16 kHz mono Int16.
         input.installTap(
             onBus: 0,
             bufferSize: AVAudioFrameCount(format.sampleRate * 0.02),
@@ -303,8 +302,8 @@ final class WalkieTalkie: ObservableObject {
             }
 
             var body = Data([0])
-            var packetSequence = sequence.bigEndian
-            sequence &+= 1
+            var packetSequence = self.sequence.bigEndian
+            self.sequence &+= 1
             body.append(Data(bytes: &packetSequence, count: 4))
             samples.withUnsafeBytes { body.append(contentsOf: $0) }
 
