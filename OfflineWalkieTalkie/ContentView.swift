@@ -11,6 +11,13 @@ struct ContentView: View {
                 .font(.headline)
                 .multilineTextAlignment(.center)
 
+            Picker("Wyjście audio", selection: $walkieTalkie.audioOutput) {
+                ForEach(AudioOutput.allCases) { output in
+                    Text(output.rawValue).tag(output)
+                }
+            }
+            .pickerStyle(.menu)
+
             Circle()
                 .fill(walkieTalkie.isTalking ? Color.red : Color.blue)
                 .frame(width: 230, height: 230)
