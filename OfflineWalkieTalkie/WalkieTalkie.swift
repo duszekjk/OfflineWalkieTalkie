@@ -35,6 +35,7 @@ final class WalkieTalkie: ObservableObject {
     init() {
         audioEngine.attach(player)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playbackFormat)
+        player.volume = 1
         audioEngine.mainMixerNode.outputVolume = 1
 
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -51,6 +52,7 @@ final class WalkieTalkie: ObservableObject {
                     try session.setPreferredSampleRate(48_000)
                     try session.setPreferredIOBufferDuration(0.02)
                     try session.setActive(true)
+                    try session.overrideOutputAudioPort(.speaker)
 
                     _ = self.audioEngine.inputNode
                     self.audioEngine.prepare()
@@ -167,7 +169,7 @@ final class WalkieTalkie: ObservableObject {
                             outputBuffer.frameLength = frameCount
                             guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
                             for index in 0..<Int(frameCount) {
-                                outputSamples[index] = max(-1, min(1, sourceSamples[index] * 1.8))
+                                outputSamples[index] = sourceSamples[index]
                             }
                         } else {
                             guard let converter = AVAudioConverter(from: sourceFormat, to: self.playbackFormat) else { continue }
@@ -182,11 +184,26 @@ final class WalkieTalkie: ObservableObject {
                                 status.pointee = .haveData
                                 return sourceBuffer
                             }
-                            guard result != .error, conversionError == nil,
-                                  let outputSamples = outputBuffer.floatChannelData?[0]
-                            else { continue }
-                            for index in 0..<Int(outputBuffer.frameLength) {
-                                outputSamples[index] = max(-1, min(1, outputSamples[index] * 1.8))
+                            guard result != .error, conversionError == nil else { continue }
+                        }
+
+                        guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
+                        var peak: Float = 0
+                        for index in 0..<Int(outputBuffer.frameLength) {
+                            peak = max(peak, abs(outputSamples[index]))
+                        }
+                        let gain = peak > 0.0001 ? min(20, 0.8 / peak) : 1
+                        for index in 0..<Int(outputBuffer.frameLength) {
+                            outputSamples[index] = max(-0.95, min(0.95, outputSamples[index] * gain))
+                        }
+
+                        do {
+                            let session = AVAudioSession.sharedInstance()
+                            try session.setActive(true)
+                            try session.overrideOutputAudioPort(.speaker)
+                        } catch {
+                            DispatchQueue.main.async {
+                                self.status = "Błąd głośnika: \(error.localizedDescription)"
                             }
                         }
 
@@ -225,7 +242,9 @@ final class WalkieTalkie: ObservableObject {
         }
 
         do {
-            try AVAudioSession.sharedInstance().setActive(true)
+            let session = AVAudioSession.sharedInstance()
+            try session.setActive(true)
+            try session.overrideOutputAudioPort(.speaker)
             if !audioEngine.isRunning {
                 audioEngine.prepare()
                 try audioEngine.start()
