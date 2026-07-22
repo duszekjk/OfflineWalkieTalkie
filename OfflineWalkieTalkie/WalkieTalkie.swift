@@ -36,6 +36,7 @@ final class WalkieTalkie: ObservableObject {
     private var connection: NWConnection?
     private var peerEndpoint: NWEndpoint?
     private var receivedData = Data()
+    private var playbackData = Data()
     private var connected = false
     private var microphoneReady = false
     private var tapInstalled = false
@@ -158,6 +159,7 @@ final class WalkieTalkie: ObservableObject {
         connection = nil
         connected = false
         receivedData.removeAll(keepingCapacity: true)
+        playbackData.removeAll(keepingCapacity: true)
         queuedBuffers = 0
         player.stop()
         player.play()
@@ -213,56 +215,65 @@ final class WalkieTalkie: ObservableObject {
                             continue
                         }
                         if type == 1 {
+                            self.playbackData.removeAll(keepingCapacity: true)
                             self.player.stop()
                             self.queuedBuffers = 0
                             self.player.play()
                             continue
                         }
-                        if self.queuedBuffers >= 12 {
-                            continue
-                        }
 
-                        let audio = packet.dropFirst(5)
-                        let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
-                        guard frameCount > 0,
-                              let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: frameCount),
-                              let inputSamples = inputBuffer.int16ChannelData?[0],
-                              let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
-                              let outputSamples = outputBuffer.floatChannelData?[0]
-                        else { continue }
+                        self.playbackData.append(packet.dropFirst(5))
 
-                        inputBuffer.frameLength = frameCount
-                        outputBuffer.frameLength = frameCount
-                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(
-                            start: inputSamples,
-                            count: Int(frameCount) * MemoryLayout<Int16>.size
-                        ))
+                        // 20 ms at 16 kHz mono Int16 = 320 samples = 640 bytes.
+                        while self.playbackData.count >= 640 {
+                            let audio = self.playbackData.prefix(640)
+                            self.playbackData.removeFirst(640)
 
-                        var squareSum: Float = 0
-                        for index in 0..<Int(frameCount) {
-                            let sample = Float(inputSamples[index]) / Float(Int16.max)
-                            outputSamples[index] = sample
-                            squareSum += sample * sample
-                        }
+                            guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: 320),
+                                  let inputSamples = inputBuffer.int16ChannelData?[0],
+                                  let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: 320),
+                                  let outputSamples = outputBuffer.floatChannelData?[0]
+                            else { continue }
 
-                        let rms = sqrt(squareSum / Float(frameCount))
-                        let gain = rms > 0.0001 ? min(65, max(3.5, 0.44 / rms)) : 1
-                        for index in 0..<Int(frameCount) {
-                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.3)
-                        }
+                            inputBuffer.frameLength = 320
+                            outputBuffer.frameLength = 320
+                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(
+                                start: inputSamples,
+                                count: 640
+                            ))
 
-                        if !self.player.isPlaying {
-                            self.player.play()
-                        }
+                            var squareSum: Float = 0
+                            for index in 0..<320 {
+                                let sample = Float(inputSamples[index]) / Float(Int16.max)
+                                outputSamples[index] = sample
+                                squareSum += sample * sample
+                            }
 
-                        self.queuedBuffers += 1
-                        self.player.scheduleBuffer(
-                            outputBuffer,
-                            completionCallbackType: .dataPlayedBack
-                        ) { [weak self] _ in
-                            DispatchQueue.main.async {
-                                guard let self else { return }
-                                self.queuedBuffers = max(0, self.queuedBuffers - 1)
+                            let rms = sqrt(squareSum / 320)
+                            let gain = rms > 0.0001 ? min(65, max(3.5, 0.44 / rms)) : 1
+                            for index in 0..<320 {
+                                outputSamples[index] = tanh(outputSamples[index] * gain * 1.3)
+                            }
+
+                            // Keep at most about 100 ms. If we fall behind, discard
+                            // the old queued audio and immediately continue with the newest block.
+                            if self.queuedBuffers >= 5 {
+                                self.player.stop()
+                                self.queuedBuffers = 0
+                                self.player.play()
+                            } else if !self.player.isPlaying {
+                                self.player.play()
+                            }
+
+                            self.queuedBuffers += 1
+                            self.player.scheduleBuffer(
+                                outputBuffer,
+                                completionCallbackType: .dataPlayedBack
+                            ) { [weak self] _ in
+                                DispatchQueue.main.async {
+                                    guard let self else { return }
+                                    self.queuedBuffers = max(0, self.queuedBuffers - 1)
+                                }
                             }
                         }
                     }
