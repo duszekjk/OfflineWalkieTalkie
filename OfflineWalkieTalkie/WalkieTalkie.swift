@@ -11,6 +11,8 @@ final class WalkieTalkie: ObservableObject {
             } else if tapInstalled {
                 audioEngine.inputNode.removeTap(onBus: 0)
                 tapInstalled = false
+                silentSamples = 0
+                sendingVoice = false
             }
         }
     }
@@ -36,6 +38,8 @@ final class WalkieTalkie: ObservableObject {
     private var microphoneReady = false
     private var tapInstalled = false
     private var queuedBuffers = 0
+    private var silentSamples = 0
+    private var sendingVoice = false
     private var sequence: UInt32 = 0
     private let peerName = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
 
@@ -61,7 +65,7 @@ final class WalkieTalkie: ObservableObject {
                         options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
                     )
                     try session.setPreferredSampleRate(48_000)
-                    try session.setPreferredIOBufferDuration(0.01)
+                    try session.setPreferredIOBufferDuration(0.005)
                     try session.setActive(true)
 
                     _ = self.audioEngine.inputNode
@@ -69,6 +73,7 @@ final class WalkieTalkie: ObservableObject {
                     try self.audioEngine.start()
                     self.player.play()
                     self.microphoneReady = true
+                    self.status = "Audio gotowe — bufor \(Int(session.ioBufferDuration * 1000)) ms"
                 } catch {
                     self.status = "Błąd audio: \(error.localizedDescription)"
                 }
@@ -118,7 +123,7 @@ final class WalkieTalkie: ObservableObject {
                 switch state {
                 case .ready:
                     self?.connected = true
-                    self?.status = "Połączono — UDP, 16 kHz"
+                    self?.status = "Połączono — UDP, ramki 5 ms"
                 case .failed(let error):
                     self?.connected = false
                     self?.status = "Rozłączono: \(error.localizedDescription)"
@@ -138,52 +143,60 @@ final class WalkieTalkie: ObservableObject {
             newConnection.receiveMessage { [weak self] data, _, _, error in
                 guard let self else { return }
 
-                if let data, data.count > 4 {
-                    let audio = data.dropFirst(4)
-                    let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
+                if let data, data.count >= 5 {
+                    let type = data[data.startIndex]
 
-                    if frameCount > 0,
-                       let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: frameCount),
-                       let inputSamples = inputBuffer.int16ChannelData?[0],
-                       let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
-                       let outputSamples = outputBuffer.floatChannelData?[0] {
-                        inputBuffer.frameLength = frameCount
-                        outputBuffer.frameLength = frameCount
-                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(
-                            start: inputSamples,
-                            count: Int(frameCount) * MemoryLayout<Int16>.size
-                        ))
+                    if type == 1 {
+                        self.player.stop()
+                        self.queuedBuffers = 0
+                        self.player.play()
+                    } else if type == 0 {
+                        let audio = data.dropFirst(5)
+                        let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
 
-                        var squareSum: Float = 0
-                        for index in 0..<Int(frameCount) {
-                            let sample = Float(inputSamples[index]) / Float(Int16.max)
-                            outputSamples[index] = sample
-                            squareSum += sample * sample
-                        }
+                        if frameCount > 0,
+                           let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: frameCount),
+                           let inputSamples = inputBuffer.int16ChannelData?[0],
+                           let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
+                           let outputSamples = outputBuffer.floatChannelData?[0] {
+                            inputBuffer.frameLength = frameCount
+                            outputBuffer.frameLength = frameCount
+                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(
+                                start: inputSamples,
+                                count: Int(frameCount) * MemoryLayout<Int16>.size
+                            ))
 
-                        let rms = sqrt(squareSum / Float(frameCount))
-                        let gain = rms > 0.0001 ? min(50, max(2.5, 0.34 / rms)) : 1
-                        for index in 0..<Int(frameCount) {
-                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.15)
-                        }
+                            var squareSum: Float = 0
+                            for index in 0..<Int(frameCount) {
+                                let sample = Float(inputSamples[index]) / Float(Int16.max)
+                                outputSamples[index] = sample
+                                squareSum += sample * sample
+                            }
 
-                        if self.queuedBuffers >= 8 {
-                            self.player.stop()
-                            self.queuedBuffers = 0
-                            self.player.play()
-                        }
-                        if !self.player.isPlaying {
-                            self.player.play()
-                        }
+                            let rms = sqrt(squareSum / Float(frameCount))
+                            let gain = rms > 0.0001 ? min(60, max(3, 0.4 / rms)) : 1
+                            for index in 0..<Int(frameCount) {
+                                outputSamples[index] = tanh(outputSamples[index] * gain * 1.25)
+                            }
 
-                        self.queuedBuffers += 1
-                        self.player.scheduleBuffer(
-                            outputBuffer,
-                            completionCallbackType: .dataPlayedBack
-                        ) { [weak self] _ in
-                            DispatchQueue.main.async {
-                                guard let self else { return }
-                                self.queuedBuffers = max(0, self.queuedBuffers - 1)
+                            if self.queuedBuffers >= 4 {
+                                self.player.stop()
+                                self.queuedBuffers = 0
+                                self.player.play()
+                            }
+                            if !self.player.isPlaying {
+                                self.player.play()
+                            }
+
+                            self.queuedBuffers += 1
+                            self.player.scheduleBuffer(
+                                outputBuffer,
+                                completionCallbackType: .dataPlayedBack
+                            ) { [weak self] _ in
+                                DispatchQueue.main.async {
+                                    guard let self else { return }
+                                    self.queuedBuffers = max(0, self.queuedBuffers - 1)
+                                }
                             }
                         }
                     }
@@ -240,8 +253,8 @@ final class WalkieTalkie: ObservableObject {
             return
         }
 
-        converter.sampleRateConverterQuality = 32
-        input.installTap(onBus: 0, bufferSize: 480, format: inputFormat) { [weak self] buffer, _ in
+        converter.sampleRateConverterQuality = 16
+        input.installTap(onBus: 0, bufferSize: 240, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
 
             let capacity = AVAudioFrameCount(
@@ -270,9 +283,39 @@ final class WalkieTalkie: ObservableObject {
                   let samples = converted.int16ChannelData?[0]
             else { return }
 
+            var squareSum: Float = 0
+            for index in 0..<Int(converted.frameLength) {
+                let sample = Float(samples[index]) / Float(Int16.max)
+                squareSum += sample * sample
+            }
+            let rms = sqrt(squareSum / Float(converted.frameLength))
+
+            if rms < 0.012 {
+                self.silentSamples += Int(converted.frameLength)
+
+                if self.sendingVoice, self.silentSamples >= 3_200 {
+                    self.sendingVoice = false
+                    var packetSequence = self.sequence.bigEndian
+                    self.sequence &+= 1
+                    var resetPacket = Data([1])
+                    resetPacket.append(Data(bytes: &packetSequence, count: 4))
+                    connection.send(
+                        content: resetPacket,
+                        contentContext: .defaultMessage,
+                        isComplete: true,
+                        completion: .contentProcessed { _ in }
+                    )
+                }
+                return
+            }
+
+            self.silentSamples = 0
+            self.sendingVoice = true
+
             var packetSequence = self.sequence.bigEndian
             self.sequence &+= 1
-            var packet = Data(bytes: &packetSequence, count: 4)
+            var packet = Data([0])
+            packet.append(Data(bytes: &packetSequence, count: 4))
             packet.append(Data(
                 bytes: samples,
                 count: Int(converted.frameLength) * MemoryLayout<Int16>.size
