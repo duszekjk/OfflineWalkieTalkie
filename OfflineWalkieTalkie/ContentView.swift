@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 
 struct ContentView: View {
@@ -11,16 +12,13 @@ struct ContentView: View {
                 .font(.headline)
                 .multilineTextAlignment(.center)
 
-            Picker("Wyjście audio", selection: $walkieTalkie.audioOutput) {
-                ForEach(AudioOutput.allCases) { output in
-                    Text(output.rawValue).tag(output)
-                }
+            HStack {
+                Text("Wyjście audio")
+                Spacer()
+                AudioRoutePicker()
+                    .frame(width: 44, height: 44)
             }
-            .pickerStyle(.segmented)
-
-            Text(walkieTalkie.currentAudioRoute)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            .padding(.horizontal)
 
             Circle()
                 .fill(walkieTalkie.isTalking ? Color.red : Color.blue)
@@ -45,7 +43,7 @@ struct ContentView: View {
                         }
                 )
 
-            Text("Tryb systemowy korzysta z aktualnie wybranego wyjścia iOS, w tym zestawu samochodowego lub Bluetooth.")
+            Text("Przycisk wyjścia audio otwiera systemową listę rzeczywiście dostępnych urządzeń.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -55,4 +53,12 @@ struct ContentView: View {
         }
         .padding()
     }
+}
+
+struct AudioRoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        AVRoutePickerView()
+    }
+
+    func updateUIView(_ view: AVRoutePickerView, context: Context) {}
 }
