@@ -8,8 +8,9 @@ final class WalkieTalkie: ObservableObject {
         didSet {
             if isTalking {
                 startTalking()
-            } else {
+            } else if tapInstalled {
                 audioEngine.inputNode.removeTap(onBus: 0)
+                tapInstalled = false
             }
         }
     }
@@ -21,6 +22,7 @@ final class WalkieTalkie: ObservableObject {
     private var connection: NWConnection?
     private var receivedData = Data()
     private var connected = false
+    private var tapInstalled = false
     private let peerName = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
 
     init() {
@@ -31,6 +33,7 @@ final class WalkieTalkie: ObservableObject {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setPreferredSampleRate(48_000)
             try session.setActive(true)
             try audioEngine.start()
             player.play()
@@ -108,20 +111,32 @@ final class WalkieTalkie: ObservableObject {
                         let length = self.receivedData.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
                         guard self.receivedData.count >= 4 + Int(length) else { break }
 
-                        let audio = self.receivedData.subdata(in: 4..<(4 + Int(length)))
+                        let packet = self.receivedData.subdata(in: 4..<(4 + Int(length)))
                         self.receivedData.removeSubrange(0..<(4 + Int(length)))
+                        guard packet.count > 4 else { continue }
 
-                        let format = self.audioEngine.inputNode.inputFormat(forBus: 0)
+                        let sampleRate = packet.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                        let audio = packet.dropFirst(4)
                         let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Float>.size)
-                        if let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) {
-                            buffer.frameLength = frameCount
-                            if let samples = buffer.floatChannelData?[0] {
-                                audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: samples, count: audio.count))
-                                for index in 0..<Int(frameCount) {
-                                    samples[index] = max(-1, min(1, samples[index] * 1.8))
-                                }
-                                self.player.scheduleBuffer(buffer)
+
+                        guard sampleRate > 0,
+                              frameCount > 0,
+                              let format = AVAudioFormat(
+                                commonFormat: .pcmFormatFloat32,
+                                sampleRate: Double(sampleRate),
+                                channels: 1,
+                                interleaved: false
+                              ),
+                              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
+                        else { continue }
+
+                        buffer.frameLength = frameCount
+                        if let samples = buffer.floatChannelData?[0] {
+                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: samples, count: audio.count))
+                            for index in 0..<Int(frameCount) {
+                                samples[index] = max(-1, min(1, samples[index] * 1.8))
                             }
+                            self.player.scheduleBuffer(buffer)
                         }
                     }
                 }
@@ -148,15 +163,26 @@ final class WalkieTalkie: ObservableObject {
         }
 
         let input = audioEngine.inputNode
-        let format = input.inputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 960, format: format) { buffer, _ in
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            status = "Mikrofon nie jest gotowy"
+            isTalking = false
+            return
+        }
+
+        input.installTap(onBus: 0, bufferSize: 960, format: nil) { buffer, _ in
             guard let channel = buffer.floatChannelData?[0] else { return }
 
             let audio = Data(bytes: channel, count: Int(buffer.frameLength) * MemoryLayout<Float>.size)
-            var length = UInt32(audio.count).bigEndian
+            var sampleRate = UInt32(buffer.format.sampleRate.rounded()).bigEndian
+            var body = Data(bytes: &sampleRate, count: 4)
+            body.append(audio)
+
+            var length = UInt32(body.count).bigEndian
             var packet = Data(bytes: &length, count: 4)
-            packet.append(audio)
+            packet.append(body)
             connection.send(content: packet, completion: .contentProcessed { _ in })
         }
+        tapInstalled = true
     }
 }
