@@ -20,7 +20,7 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_offlinewalkie._udp</string>
+		<string>_offlinewalkie._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Aplikacja łączy się bezpośrednio z pobliskimi iPhone’ami.</string>
