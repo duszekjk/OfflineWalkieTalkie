@@ -50,7 +50,7 @@ final class WalkieTalkie: ObservableObject {
                     let session = AVAudioSession.sharedInstance()
                     try session.setCategory(
                         .playAndRecord,
-                        mode: .voiceChat,
+                        mode: .videoChat,
                         options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
                     )
                     try session.setPreferredSampleRate(48_000)
@@ -191,13 +191,14 @@ final class WalkieTalkie: ObservableObject {
                         }
 
                         guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
-                        var peak: Float = 0
+                        var sumOfSquares: Float = 0
                         for index in 0..<Int(outputBuffer.frameLength) {
-                            peak = max(peak, abs(outputSamples[index]))
+                            sumOfSquares += outputSamples[index] * outputSamples[index]
                         }
-                        let gain = peak > 0.0001 ? min(30, 0.98 / peak) : 1
+                        let rms = sqrt(sumOfSquares / Float(max(1, outputBuffer.frameLength)))
+                        let gain = rms > 0.0001 ? min(40, max(2, 0.35 / rms)) : 1
                         for index in 0..<Int(outputBuffer.frameLength) {
-                            outputSamples[index] = max(-1, min(1, outputSamples[index] * gain))
+                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.4)
                         }
 
                         if !self.audioEngine.isRunning {
