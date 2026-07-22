@@ -31,6 +31,7 @@ final class WalkieTalkie: ObservableObject {
         channels: 1,
         interleaved: false
     )!
+
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connection: NWConnection?
@@ -40,7 +41,6 @@ final class WalkieTalkie: ObservableObject {
     private var connected = false
     private var microphoneReady = false
     private var tapInstalled = false
-    private var queuedBuffers = 0
     private var silentSamples = 0
     private var sendingVoice = false
     private var sequence: UInt32 = 0
@@ -160,7 +160,6 @@ final class WalkieTalkie: ObservableObject {
         connected = false
         receivedData.removeAll(keepingCapacity: true)
         playbackData.removeAll(keepingCapacity: true)
-        queuedBuffers = 0
         player.stop()
         player.play()
         status = "Szukam drugiego urządzenia…"
@@ -217,14 +216,12 @@ final class WalkieTalkie: ObservableObject {
                         if type == 1 {
                             self.playbackData.removeAll(keepingCapacity: true)
                             self.player.stop()
-                            self.queuedBuffers = 0
                             self.player.play()
                             continue
                         }
 
                         self.playbackData.append(packet.dropFirst(5))
 
-                        // 20 ms at 16 kHz mono Int16 = 320 samples = 640 bytes.
                         while self.playbackData.count >= 640 {
                             let audio = self.playbackData.prefix(640)
                             self.playbackData.removeFirst(640)
@@ -237,10 +234,7 @@ final class WalkieTalkie: ObservableObject {
 
                             inputBuffer.frameLength = 320
                             outputBuffer.frameLength = 320
-                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(
-                                start: inputSamples,
-                                count: 640
-                            ))
+                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: inputSamples, count: 640))
 
                             var squareSum: Float = 0
                             for index in 0..<320 {
@@ -255,26 +249,10 @@ final class WalkieTalkie: ObservableObject {
                                 outputSamples[index] = tanh(outputSamples[index] * gain * 1.3)
                             }
 
-                            // Keep at most about 100 ms. If we fall behind, discard
-                            // the old queued audio and immediately continue with the newest block.
-                            if self.queuedBuffers >= 5 {
-                                self.player.stop()
-                                self.queuedBuffers = 0
-                                self.player.play()
-                            } else if !self.player.isPlaying {
+                            if !self.player.isPlaying {
                                 self.player.play()
                             }
-
-                            self.queuedBuffers += 1
-                            self.player.scheduleBuffer(
-                                outputBuffer,
-                                completionCallbackType: .dataPlayedBack
-                            ) { [weak self] _ in
-                                DispatchQueue.main.async {
-                                    guard let self else { return }
-                                    self.queuedBuffers = max(0, self.queuedBuffers - 1)
-                                }
-                            }
+                            self.player.scheduleBuffer(outputBuffer)
                         }
                     }
                 }
@@ -388,10 +366,7 @@ final class WalkieTalkie: ObservableObject {
             self.sequence &+= 1
             var body = Data([0])
             body.append(Data(bytes: &packetSequence, count: 4))
-            body.append(Data(
-                bytes: samples,
-                count: Int(converted.frameLength) * MemoryLayout<Int16>.size
-            ))
+            body.append(Data(bytes: samples, count: Int(converted.frameLength) * MemoryLayout<Int16>.size))
             var length = UInt16(body.count).bigEndian
             var packet = Data(bytes: &length, count: 2)
             packet.append(body)
