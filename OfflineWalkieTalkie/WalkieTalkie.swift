@@ -11,23 +11,15 @@ final class WalkieTalkie: ObservableObject {
             } else if tapInstalled {
                 audioEngine.inputNode.removeTap(onBus: 0)
                 tapInstalled = false
-                silentSamples = 0
-                sendingVoice = false
             }
         }
     }
 
     private let audioEngine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
-    private let networkFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16,
-        sampleRate: 16_000,
-        channels: 1,
-        interleaved: false
-    )!
     private let playbackFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
-        sampleRate: 16_000,
+        sampleRate: 48_000,
         channels: 1,
         interleaved: false
     )!
@@ -37,12 +29,9 @@ final class WalkieTalkie: ObservableObject {
     private var connection: NWConnection?
     private var peerEndpoint: NWEndpoint?
     private var receivedData = Data()
-    private var playbackData = Data()
     private var connected = false
     private var microphoneReady = false
     private var tapInstalled = false
-    private var silentSamples = 0
-    private var sendingVoice = false
     private var sequence: UInt32 = 0
     private var lastReceived = Date()
     private var reconnectTimer: Timer?
@@ -159,7 +148,6 @@ final class WalkieTalkie: ObservableObject {
         connection = nil
         connected = false
         receivedData.removeAll(keepingCapacity: true)
-        playbackData.removeAll(keepingCapacity: true)
         player.stop()
         player.play()
         status = "Szukam drugiego urządzenia…"
@@ -180,7 +168,7 @@ final class WalkieTalkie: ObservableObject {
                 case .ready:
                     self.connected = true
                     self.lastReceived = Date()
-                    self.status = "Połączono — ramki 5 ms"
+                    self.status = "Połączono"
                 case .failed(let error):
                     self.status = "Rozłączono: \(error.localizedDescription)"
                     self.resetConnection()
@@ -207,53 +195,79 @@ final class WalkieTalkie: ObservableObject {
 
                         let packet = self.receivedData.subdata(in: 2..<(2 + Int(length)))
                         self.receivedData.removeSubrange(0..<(2 + Int(length)))
-                        guard packet.count >= 5 else { continue }
+                        guard packet.count >= 9 else { continue }
 
-                        let type = packet[packet.startIndex]
-                        if type == 2 {
+                        if packet[packet.startIndex] == 2 {
                             continue
                         }
-                        if type == 1 {
-                            self.playbackData.removeAll(keepingCapacity: true)
-                            self.player.stop()
+
+                        let sampleRate = packet.dropFirst(5).prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                        let audio = packet.dropFirst(9)
+                        let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Float>.size)
+
+                        guard sampleRate > 0,
+                              frameCount > 0,
+                              let sourceFormat = AVAudioFormat(
+                                commonFormat: .pcmFormatFloat32,
+                                sampleRate: Double(sampleRate),
+                                channels: 1,
+                                interleaved: false
+                              ),
+                              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount),
+                              let sourceSamples = sourceBuffer.floatChannelData?[0]
+                        else { continue }
+
+                        sourceBuffer.frameLength = frameCount
+                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(
+                            start: sourceSamples,
+                            count: audio.count
+                        ))
+
+                        let outputCapacity = AVAudioFrameCount(
+                            (Double(frameCount) * self.playbackFormat.sampleRate / sourceFormat.sampleRate).rounded(.up)
+                        ) + 8
+                        guard let outputBuffer = AVAudioPCMBuffer(
+                            pcmFormat: self.playbackFormat,
+                            frameCapacity: outputCapacity
+                        ) else { continue }
+
+                        if sourceFormat.sampleRate == self.playbackFormat.sampleRate {
+                            outputBuffer.frameLength = frameCount
+                            guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
+                            for index in 0..<Int(frameCount) {
+                                outputSamples[index] = sourceSamples[index]
+                            }
+                        } else {
+                            guard let converter = AVAudioConverter(from: sourceFormat, to: self.playbackFormat) else { continue }
+                            var supplied = false
+                            var conversionError: NSError?
+                            let result = converter.convert(to: outputBuffer, error: &conversionError) { _, status in
+                                if supplied {
+                                    status.pointee = .endOfStream
+                                    return nil
+                                }
+                                supplied = true
+                                status.pointee = .haveData
+                                return sourceBuffer
+                            }
+                            guard result != .error, conversionError == nil else { continue }
+                        }
+
+                        guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
+                        var squareSum: Float = 0
+                        for index in 0..<Int(outputBuffer.frameLength) {
+                            squareSum += outputSamples[index] * outputSamples[index]
+                        }
+                        let rms = sqrt(squareSum / Float(max(1, outputBuffer.frameLength)))
+                        let gain = rms > 0.0001 ? min(40, max(2, 0.42 / rms)) : 1
+                        for index in 0..<Int(outputBuffer.frameLength) {
+                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.25)
+                        }
+
+                        if !self.player.isPlaying {
                             self.player.play()
-                            continue
                         }
-
-                        self.playbackData.append(packet.dropFirst(5))
-
-                        while self.playbackData.count >= 640 {
-                            let audio = self.playbackData.prefix(640)
-                            self.playbackData.removeFirst(640)
-
-                            guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: 320),
-                                  let inputSamples = inputBuffer.int16ChannelData?[0],
-                                  let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: 320),
-                                  let outputSamples = outputBuffer.floatChannelData?[0]
-                            else { continue }
-
-                            inputBuffer.frameLength = 320
-                            outputBuffer.frameLength = 320
-                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: inputSamples, count: 640))
-
-                            var squareSum: Float = 0
-                            for index in 0..<320 {
-                                let sample = Float(inputSamples[index]) / Float(Int16.max)
-                                outputSamples[index] = sample
-                                squareSum += sample * sample
-                            }
-
-                            let rms = sqrt(squareSum / 320)
-                            let gain = rms > 0.0001 ? min(65, max(3.5, 0.44 / rms)) : 1
-                            for index in 0..<320 {
-                                outputSamples[index] = tanh(outputSamples[index] * gain * 1.3)
-                            }
-
-                            if !self.player.isPlaying {
-                                self.player.play()
-                            }
-                            self.player.scheduleBuffer(outputBuffer)
-                        }
+                        self.player.scheduleBuffer(outputBuffer)
                     }
                 }
 
@@ -298,75 +312,33 @@ final class WalkieTalkie: ObservableObject {
         }
 
         let input = audioEngine.inputNode
-        let inputFormat = input.inputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0,
-              inputFormat.channelCount > 0,
-              let converter = AVAudioConverter(from: inputFormat, to: networkFormat)
-        else {
+        let format = input.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
             status = "Brak aktywnego wejścia mikrofonowego"
             isTalking = false
             return
         }
 
-        converter.sampleRateConverterQuality = 16
-        input.installTap(onBus: 0, bufferSize: 240, format: inputFormat) { [weak self, weak connection] buffer, _ in
-            guard let self, let connection, self.connection === connection else { return }
-
-            let capacity = AVAudioFrameCount(
-                (Double(buffer.frameLength) * self.networkFormat.sampleRate / inputFormat.sampleRate).rounded(.up)
-            ) + 8
-            guard let converted = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: capacity) else { return }
-
-            var supplied = false
-            var conversionError: NSError?
-            let result = converter.convert(to: converted, error: &conversionError) { _, status in
-                if supplied {
-                    status.pointee = .noDataNow
-                    return nil
-                }
-                supplied = true
-                status.pointee = .haveData
-                return buffer
-            }
-
-            guard result != .error,
-                  conversionError == nil,
-                  converted.frameLength > 0,
-                  let samples = converted.int16ChannelData?[0]
+        input.installTap(onBus: 0, bufferSize: 480, format: format) { [weak self, weak connection] buffer, _ in
+            guard let self,
+                  let connection,
+                  self.connection === connection,
+                  let channel = buffer.floatChannelData?[0]
             else { return }
 
-            var squareSum: Float = 0
-            for index in 0..<Int(converted.frameLength) {
-                let sample = Float(samples[index]) / Float(Int16.max)
-                squareSum += sample * sample
-            }
-            let rms = sqrt(squareSum / Float(converted.frameLength))
-
-            if rms < 0.012 {
-                self.silentSamples += Int(converted.frameLength)
-
-                if self.sendingVoice, self.silentSamples >= 3_200 {
-                    self.sendingVoice = false
-                    var packetSequence = self.sequence.bigEndian
-                    self.sequence &+= 1
-                    var body = Data([1])
-                    body.append(Data(bytes: &packetSequence, count: 4))
-                    var length = UInt16(body.count).bigEndian
-                    var packet = Data(bytes: &length, count: 2)
-                    packet.append(body)
-                    connection.send(content: packet, completion: .contentProcessed { _ in })
-                }
-                return
-            }
-
-            self.silentSamples = 0
-            self.sendingVoice = true
-
+            var body = Data([0])
             var packetSequence = self.sequence.bigEndian
             self.sequence &+= 1
-            var body = Data([0])
             body.append(Data(bytes: &packetSequence, count: 4))
-            body.append(Data(bytes: samples, count: Int(converted.frameLength) * MemoryLayout<Int16>.size))
+
+            var sampleRate = UInt32(buffer.format.sampleRate.rounded()).bigEndian
+            body.append(Data(bytes: &sampleRate, count: 4))
+            body.append(Data(
+                bytes: channel,
+                count: Int(buffer.frameLength) * MemoryLayout<Float>.size
+            ))
+
+            guard body.count <= Int(UInt16.max) else { return }
             var length = UInt16(body.count).bigEndian
             var packet = Data(bytes: &length, count: 2)
             packet.append(body)
