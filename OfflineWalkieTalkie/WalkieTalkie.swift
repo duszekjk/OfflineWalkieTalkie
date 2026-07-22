@@ -2,8 +2,20 @@ import AVFoundation
 import Network
 import UIKit
 
+enum AudioOutput: String, CaseIterable, Identifiable {
+    case automatic = "Automatycznie"
+    case speaker = "Głośnik"
+    case receiver = "Słuchawka urządzenia"
+    case bluetooth = "Bluetooth / samochód"
+
+    var id: Self { self }
+}
+
 final class WalkieTalkie: ObservableObject {
     @Published var status = "Szukam drugiego iPhone’a…"
+    @Published var audioOutput: AudioOutput = .automatic {
+        didSet { applyAudioOutput() }
+    }
     @Published var isTalking = false {
         didSet {
             if isTalking {
@@ -48,11 +60,15 @@ final class WalkieTalkie: ObservableObject {
 
                 do {
                     let session = AVAudioSession.sharedInstance()
-                    try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+                    try session.setCategory(
+                        .playAndRecord,
+                        mode: .voiceChat,
+                        options: [.allowBluetooth, .allowBluetoothA2DP]
+                    )
                     try session.setPreferredSampleRate(48_000)
                     try session.setPreferredIOBufferDuration(0.02)
                     try session.setActive(true)
-                    try session.overrideOutputAudioPort(.speaker)
+                    self.applyAudioOutput()
 
                     _ = self.audioEngine.inputNode
                     self.audioEngine.prepare()
@@ -94,6 +110,39 @@ final class WalkieTalkie: ObservableObject {
             }
         }
         browser?.start(queue: .main)
+    }
+
+    private func applyAudioOutput() {
+        let session = AVAudioSession.sharedInstance()
+        guard session.recordPermission == .granted else { return }
+
+        do {
+            try session.setActive(true)
+
+            switch audioOutput {
+            case .automatic:
+                try session.setPreferredInput(nil)
+                try session.overrideOutputAudioPort(.none)
+            case .speaker:
+                try session.setPreferredInput(nil)
+                try session.overrideOutputAudioPort(.speaker)
+            case .receiver:
+                try session.setPreferredInput(nil)
+                try session.overrideOutputAudioPort(.none)
+            case .bluetooth:
+                guard let bluetooth = session.availableInputs?.first(where: {
+                    $0.portType == .bluetoothHFP
+                }) else {
+                    status = "Brak podłączonego zestawu Bluetooth do rozmów"
+                    audioOutput = .automatic
+                    return
+                }
+                try session.setPreferredInput(bluetooth)
+                try session.overrideOutputAudioPort(.none)
+            }
+        } catch {
+            status = "Błąd wyjścia audio: \(error.localizedDescription)"
+        }
     }
 
     private func use(_ newConnection: NWConnection) {
@@ -192,21 +241,12 @@ final class WalkieTalkie: ObservableObject {
                         for index in 0..<Int(outputBuffer.frameLength) {
                             peak = max(peak, abs(outputSamples[index]))
                         }
-                        let gain = peak > 0.0001 ? min(20, 0.8 / peak) : 1
+                        let gain = peak > 0.0001 ? min(30, 0.98 / peak) : 1
                         for index in 0..<Int(outputBuffer.frameLength) {
-                            outputSamples[index] = max(-0.95, min(0.95, outputSamples[index] * gain))
+                            outputSamples[index] = max(-1, min(1, outputSamples[index] * gain))
                         }
 
-                        do {
-                            let session = AVAudioSession.sharedInstance()
-                            try session.setActive(true)
-                            try session.overrideOutputAudioPort(.speaker)
-                        } catch {
-                            DispatchQueue.main.async {
-                                self.status = "Błąd głośnika: \(error.localizedDescription)"
-                            }
-                        }
-
+                        self.applyAudioOutput()
                         if !self.player.isPlaying {
                             self.player.play()
                         }
@@ -242,9 +282,8 @@ final class WalkieTalkie: ObservableObject {
         }
 
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setActive(true)
-            try session.overrideOutputAudioPort(.speaker)
+            try AVAudioSession.sharedInstance().setActive(true)
+            applyAudioOutput()
             if !audioEngine.isRunning {
                 audioEngine.prepare()
                 try audioEngine.start()
