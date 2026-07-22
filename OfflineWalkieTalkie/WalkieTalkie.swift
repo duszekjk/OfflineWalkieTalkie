@@ -17,19 +17,26 @@ final class WalkieTalkie: ObservableObject {
 
     private let audioEngine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    private let networkFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+    )!
     private let playbackFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
-        sampleRate: 48_000,
+        sampleRate: 16_000,
         channels: 1,
         interleaved: false
     )!
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connection: NWConnection?
-    private var receivedData = Data()
     private var connected = false
     private var microphoneReady = false
     private var tapInstalled = false
+    private var queuedBuffers = 0
+    private var sequence: UInt32 = 0
     private let peerName = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
 
     init() {
@@ -54,7 +61,7 @@ final class WalkieTalkie: ObservableObject {
                         options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
                     )
                     try session.setPreferredSampleRate(48_000)
-                    try session.setPreferredIOBufferDuration(0.02)
+                    try session.setPreferredIOBufferDuration(0.01)
                     try session.setActive(true)
 
                     _ = self.audioEngine.inputNode
@@ -69,10 +76,10 @@ final class WalkieTalkie: ObservableObject {
         }
 
         do {
-            let parameters = NWParameters.tcp
+            let parameters = NWParameters.udp
             parameters.includePeerToPeer = true
             listener = try NWListener(using: parameters)
-            listener?.service = NWListener.Service(name: peerName, type: "_offlinewalkie._tcp")
+            listener?.service = NWListener.Service(name: peerName, type: "_offlinewalkie._udp")
             listener?.newConnectionHandler = { [weak self] newConnection in
                 DispatchQueue.main.async {
                     self?.use(newConnection)
@@ -83,9 +90,9 @@ final class WalkieTalkie: ObservableObject {
             status = "Błąd nasłuchiwania: \(error.localizedDescription)"
         }
 
-        let parameters = NWParameters.tcp
+        let parameters = NWParameters.udp
         parameters.includePeerToPeer = true
-        browser = NWBrowser(for: .bonjour(type: "_offlinewalkie._tcp", domain: nil), using: parameters)
+        browser = NWBrowser(for: .bonjour(type: "_offlinewalkie._udp", domain: nil), using: parameters)
         browser?.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self, self.connection == nil else { return }
 
@@ -111,7 +118,7 @@ final class WalkieTalkie: ObservableObject {
                 switch state {
                 case .ready:
                     self?.connected = true
-                    self?.status = "Połączono"
+                    self?.status = "Połączono — UDP, 16 kHz"
                 case .failed(let error):
                     self?.connected = false
                     self?.status = "Rozłączono: \(error.localizedDescription)"
@@ -128,95 +135,61 @@ final class WalkieTalkie: ObservableObject {
         newConnection.start(queue: .main)
 
         func receive() {
-            newConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
+            newConnection.receiveMessage { [weak self] data, _, _, error in
                 guard let self else { return }
 
-                if let data {
-                    self.receivedData.append(data)
+                if let data, data.count > 4 {
+                    let audio = data.dropFirst(4)
+                    let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
 
-                    while self.receivedData.count >= 4 {
-                        let length = self.receivedData.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-                        guard self.receivedData.count >= 4 + Int(length) else { break }
+                    if frameCount > 0,
+                       let inputBuffer = AVAudioPCMBuffer(pcmFormat: self.networkFormat, frameCapacity: frameCount),
+                       let inputSamples = inputBuffer.int16ChannelData?[0],
+                       let outputBuffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
+                       let outputSamples = outputBuffer.floatChannelData?[0] {
+                        inputBuffer.frameLength = frameCount
+                        outputBuffer.frameLength = frameCount
+                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(
+                            start: inputSamples,
+                            count: Int(frameCount) * MemoryLayout<Int16>.size
+                        ))
 
-                        let packet = self.receivedData.subdata(in: 4..<(4 + Int(length)))
-                        self.receivedData.removeSubrange(0..<(4 + Int(length)))
-                        guard packet.count > 4 else { continue }
-
-                        let sampleRate = packet.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-                        let audio = packet.dropFirst(4)
-                        let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Float>.size)
-
-                        guard sampleRate > 0,
-                              frameCount > 0,
-                              let sourceFormat = AVAudioFormat(
-                                commonFormat: .pcmFormatFloat32,
-                                sampleRate: Double(sampleRate),
-                                channels: 1,
-                                interleaved: false
-                              ),
-                              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount)
-                        else { continue }
-
-                        sourceBuffer.frameLength = frameCount
-                        guard let sourceSamples = sourceBuffer.floatChannelData?[0] else { continue }
-                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: sourceSamples, count: audio.count))
-
-                        let ratio = self.playbackFormat.sampleRate / sourceFormat.sampleRate
-                        let outputCapacity = AVAudioFrameCount((Double(frameCount) * ratio).rounded(.up)) + 1
-                        guard let outputBuffer = AVAudioPCMBuffer(
-                            pcmFormat: self.playbackFormat,
-                            frameCapacity: outputCapacity
-                        ) else { continue }
-
-                        if sourceFormat.sampleRate == self.playbackFormat.sampleRate {
-                            outputBuffer.frameLength = frameCount
-                            guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
-                            for index in 0..<Int(frameCount) {
-                                outputSamples[index] = sourceSamples[index]
-                            }
-                        } else {
-                            guard let converter = AVAudioConverter(from: sourceFormat, to: self.playbackFormat) else { continue }
-                            var supplied = false
-                            var conversionError: NSError?
-                            let result = converter.convert(to: outputBuffer, error: &conversionError) { _, status in
-                                if supplied {
-                                    status.pointee = .endOfStream
-                                    return nil
-                                }
-                                supplied = true
-                                status.pointee = .haveData
-                                return sourceBuffer
-                            }
-                            guard result != .error, conversionError == nil else { continue }
+                        var squareSum: Float = 0
+                        for index in 0..<Int(frameCount) {
+                            let sample = Float(inputSamples[index]) / Float(Int16.max)
+                            outputSamples[index] = sample
+                            squareSum += sample * sample
                         }
 
-                        guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
-                        var sumOfSquares: Float = 0
-                        for index in 0..<Int(outputBuffer.frameLength) {
-                            sumOfSquares += outputSamples[index] * outputSamples[index]
-                        }
-                        let rms = sqrt(sumOfSquares / Float(max(1, outputBuffer.frameLength)))
-                        let gain = rms > 0.0001 ? min(40, max(2, 0.35 / rms)) : 1
-                        for index in 0..<Int(outputBuffer.frameLength) {
-                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.4)
+                        let rms = sqrt(squareSum / Float(frameCount))
+                        let gain = rms > 0.0001 ? min(50, max(2.5, 0.34 / rms)) : 1
+                        for index in 0..<Int(frameCount) {
+                            outputSamples[index] = tanh(outputSamples[index] * gain * 1.15)
                         }
 
-                        if !self.audioEngine.isRunning {
-                            do {
-                                self.audioEngine.prepare()
-                                try self.audioEngine.start()
-                            } catch {
-                                continue
-                            }
+                        if self.queuedBuffers >= 8 {
+                            self.player.stop()
+                            self.queuedBuffers = 0
+                            self.player.play()
                         }
                         if !self.player.isPlaying {
                             self.player.play()
                         }
-                        self.player.scheduleBuffer(outputBuffer)
+
+                        self.queuedBuffers += 1
+                        self.player.scheduleBuffer(
+                            outputBuffer,
+                            completionCallbackType: .dataPlayedBack
+                        ) { [weak self] _ in
+                            DispatchQueue.main.async {
+                                guard let self else { return }
+                                self.queuedBuffers = max(0, self.queuedBuffers - 1)
+                            }
+                        }
                     }
                 }
 
-                if complete || error != nil {
+                if error != nil {
                     DispatchQueue.main.async {
                         self.connected = false
                         self.connection = nil
@@ -257,25 +230,60 @@ final class WalkieTalkie: ObservableObject {
         }
 
         let input = audioEngine.inputNode
-        let format = input.inputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
+        let inputFormat = input.inputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0,
+              inputFormat.channelCount > 0,
+              let converter = AVAudioConverter(from: inputFormat, to: networkFormat)
+        else {
             status = "Brak aktywnego wejścia mikrofonowego"
             isTalking = false
             return
         }
 
-        input.installTap(onBus: 0, bufferSize: 960, format: format) { buffer, _ in
-            guard let channel = buffer.floatChannelData?[0] else { return }
+        converter.sampleRateConverterQuality = 32
+        input.installTap(onBus: 0, bufferSize: 480, format: inputFormat) { [weak self] buffer, _ in
+            guard let self else { return }
 
-            let audio = Data(bytes: channel, count: Int(buffer.frameLength) * MemoryLayout<Float>.size)
-            var sampleRate = UInt32(buffer.format.sampleRate.rounded()).bigEndian
-            var body = Data(bytes: &sampleRate, count: 4)
-            body.append(audio)
+            let capacity = AVAudioFrameCount(
+                (Double(buffer.frameLength) * self.networkFormat.sampleRate / inputFormat.sampleRate).rounded(.up)
+            ) + 8
+            guard let converted = AVAudioPCMBuffer(
+                pcmFormat: self.networkFormat,
+                frameCapacity: capacity
+            ) else { return }
 
-            var length = UInt32(body.count).bigEndian
-            var packet = Data(bytes: &length, count: 4)
-            packet.append(body)
-            connection.send(content: packet, completion: .contentProcessed { _ in })
+            var supplied = false
+            var conversionError: NSError?
+            let result = converter.convert(to: converted, error: &conversionError) { _, status in
+                if supplied {
+                    status.pointee = .noDataNow
+                    return nil
+                }
+                supplied = true
+                status.pointee = .haveData
+                return buffer
+            }
+
+            guard result != .error,
+                  conversionError == nil,
+                  converted.frameLength > 0,
+                  let samples = converted.int16ChannelData?[0]
+            else { return }
+
+            var packetSequence = self.sequence.bigEndian
+            self.sequence &+= 1
+            var packet = Data(bytes: &packetSequence, count: 4)
+            packet.append(Data(
+                bytes: samples,
+                count: Int(converted.frameLength) * MemoryLayout<Int16>.size
+            ))
+
+            connection.send(
+                content: packet,
+                contentContext: .defaultMessage,
+                isComplete: true,
+                completion: .contentProcessed { _ in }
+            )
         }
         tapInstalled = true
     }
