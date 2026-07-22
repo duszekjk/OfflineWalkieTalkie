@@ -1,6 +1,7 @@
 import AVFoundation
 import Network
 import UIKit
+import os
 
 final class WalkieTalkie: ObservableObject {
     @Published var status = "Szukam drugiego urządzenia…"
@@ -15,8 +16,38 @@ final class WalkieTalkie: ObservableObject {
         }
     }
 
+    private struct AudioBufferState {
+        var samples = [Float](repeating: 0, count: 3_200)
+        var readIndex = 0
+        var writeIndex = 0
+        var count = 0
+    }
+
     private let audioEngine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    private let audioBuffer = OSAllocatedUnfairLock(initialState: AudioBufferState())
+    private lazy var sourceNode = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList in
+        guard let self else { return noErr }
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+
+        self.audioBuffer.withLock { state in
+            for buffer in buffers {
+                guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+
+                for index in 0..<Int(frameCount) {
+                    if state.count > 0 {
+                        data[index] = state.samples[state.readIndex]
+                        state.readIndex = (state.readIndex + 1) % state.samples.count
+                        state.count -= 1
+                    } else {
+                        data[index] = 0
+                    }
+                }
+            }
+        }
+
+        return noErr
+    }
+
     private let playbackFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: 16_000,
@@ -44,9 +75,8 @@ final class WalkieTalkie: ObservableObject {
         parameters = NWParameters(tls: nil, tcp: tcpOptions)
         parameters.includePeerToPeer = true
 
-        audioEngine.attach(player)
-        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playbackFormat)
-        player.volume = 1
+        audioEngine.attach(sourceNode)
+        audioEngine.connect(sourceNode, to: audioEngine.mainMixerNode, format: playbackFormat)
         audioEngine.mainMixerNode.outputVolume = 1
 
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -71,7 +101,6 @@ final class WalkieTalkie: ObservableObject {
                     _ = self.audioEngine.inputNode
                     self.audioEngine.prepare()
                     try self.audioEngine.start()
-                    self.player.play()
                     self.microphoneReady = true
                 } catch {
                     self.status = "Błąd audio: \(error.localizedDescription)"
@@ -91,23 +120,6 @@ final class WalkieTalkie: ObservableObject {
         } catch {
             status = "Błąd nasłuchiwania: \(error.localizedDescription)"
         }
-
-        browser = NWBrowser(for: .bonjour(type: "_offlinewalkie._tcp", domain: nil), using: parameters)
-        browser?.browseResultsChangedHandler = { [weak self] results, _ in
-            guard let self else { return }
-
-            self.peerEndpoint = nil
-            for result in results {
-                if case let .service(name, _, _, _) = result.endpoint, self.peerName < name {
-                    self.peerEndpoint = result.endpoint
-                    if self.connection == nil {
-                        self.use(NWConnection(to: result.endpoint, using: self.parameters))
-                    }
-                    break
-                }
-            }
-        }
-        browser?.start(queue: .main)
 
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -132,9 +144,47 @@ final class WalkieTalkie: ObservableObject {
                         }
                     }
                 })
-            } else if self.connection == nil, let peerEndpoint = self.peerEndpoint {
-                self.use(NWConnection(to: peerEndpoint, using: self.parameters))
+                return
             }
+
+            if self.connection == nil, let peerEndpoint = self.peerEndpoint {
+                self.use(NWConnection(to: peerEndpoint, using: self.parameters))
+                return
+            }
+
+            guard self.browser == nil else { return }
+
+            let browser = NWBrowser(
+                for: .bonjour(type: "_offlinewalkie._tcp", domain: nil),
+                using: self.parameters
+            )
+            self.browser = browser
+            browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+                DispatchQueue.main.async {
+                    guard let self, let browser, self.browser === browser else { return }
+
+                    self.peerEndpoint = nil
+                    for result in results {
+                        if case let .service(name, _, _, _) = result.endpoint, self.peerName < name {
+                            self.peerEndpoint = result.endpoint
+                            if self.connection == nil {
+                                self.use(NWConnection(to: result.endpoint, using: self.parameters))
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+            browser.stateUpdateHandler = { [weak self, weak browser] state in
+                if case .failed = state {
+                    DispatchQueue.main.async {
+                        guard let self, let browser, self.browser === browser else { return }
+                        browser.cancel()
+                        self.browser = nil
+                    }
+                }
+            }
+            browser.start(queue: .main)
         }
     }
 
@@ -148,8 +198,14 @@ final class WalkieTalkie: ObservableObject {
         connection = nil
         connected = false
         receivedData.removeAll(keepingCapacity: true)
-        player.stop()
-        player.play()
+        peerEndpoint = nil
+        browser?.cancel()
+        browser = nil
+        audioBuffer.withLock { state in
+            state.readIndex = 0
+            state.writeIndex = 0
+            state.count = 0
+        }
         status = "Szukam drugiego urządzenia…"
     }
 
@@ -168,6 +224,8 @@ final class WalkieTalkie: ObservableObject {
                 case .ready:
                     self.connected = true
                     self.lastReceived = Date()
+                    self.browser?.cancel()
+                    self.browser = nil
                     self.status = "Połączono — 16 kHz"
                 case .failed(let error):
                     self.status = "Rozłączono: \(error.localizedDescription)"
@@ -199,33 +257,34 @@ final class WalkieTalkie: ObservableObject {
                         if packet[packet.startIndex] == 2 { continue }
 
                         let audio = packet.dropFirst(5)
-                        let frameCount = AVAudioFrameCount(audio.count / MemoryLayout<Int16>.size)
-                        guard frameCount > 0,
-                              let buffer = AVAudioPCMBuffer(pcmFormat: self.playbackFormat, frameCapacity: frameCount),
-                              let output = buffer.floatChannelData?[0]
-                        else { continue }
+                        self.audioBuffer.withLock { state in
+                            audio.withUnsafeBytes { rawBuffer in
+                                let input = rawBuffer.bindMemory(to: Int16.self)
+                                var squareSum: Float = 0
 
-                        buffer.frameLength = frameCount
-                        audio.withUnsafeBytes { rawBuffer in
-                            let input = rawBuffer.bindMemory(to: Int16.self)
-                            var squareSum: Float = 0
-                            for index in 0..<Int(frameCount) {
-                                let sample = Float(Int16(littleEndian: input[index])) / Float(Int16.max)
-                                output[index] = sample
-                                squareSum += sample * sample
-                            }
+                                for sample in input {
+                                    let value = Float(Int16(littleEndian: sample)) / Float(Int16.max)
+                                    squareSum += value * value
+                                }
 
-                            let rms = sqrt(squareSum / Float(frameCount))
-                            let gain = rms > 0.0001 ? min(45, max(2.2, 0.45 / rms)) : 1
-                            for index in 0..<Int(frameCount) {
-                                output[index] = tanh(output[index] * gain * 1.3)
+                                let rms = sqrt(squareSum / Float(max(1, input.count)))
+                                let gain = rms > 0.0001 ? min(45, max(2.2, 0.45 / rms)) : 1
+
+                                for sample in input {
+                                    let value = Float(Int16(littleEndian: sample)) / Float(Int16.max)
+                                    let amplified = tanh(value * gain * 1.3)
+
+                                    if state.count == state.samples.count {
+                                        state.readIndex = (state.readIndex + 1) % state.samples.count
+                                        state.count -= 1
+                                    }
+
+                                    state.samples[state.writeIndex] = amplified
+                                    state.writeIndex = (state.writeIndex + 1) % state.samples.count
+                                    state.count += 1
+                                }
                             }
                         }
-
-                        if !self.player.isPlaying {
-                            self.player.play()
-                        }
-                        self.player.scheduleBuffer(buffer)
                     }
                 }
 
@@ -261,7 +320,6 @@ final class WalkieTalkie: ObservableObject {
             if !audioEngine.isRunning {
                 audioEngine.prepare()
                 try audioEngine.start()
-                player.play()
             }
         } catch {
             status = "Błąd mikrofonu: \(error.localizedDescription)"
