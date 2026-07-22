@@ -3,17 +3,16 @@ import Network
 import UIKit
 
 enum AudioOutput: String, CaseIterable, Identifiable {
-    case automatic = "Automatycznie"
-    case speaker = "Głośnik"
-    case receiver = "Słuchawka urządzenia"
-    case bluetooth = "Bluetooth / samochód"
+    case system = "System / Bluetooth / samochód"
+    case speaker = "Głośnik urządzenia"
 
     var id: Self { self }
 }
 
 final class WalkieTalkie: ObservableObject {
     @Published var status = "Szukam drugiego iPhone’a…"
-    @Published var audioOutput: AudioOutput = .automatic {
+    @Published var currentAudioRoute = "Wyjście audio: —"
+    @Published var audioOutput: AudioOutput = .system {
         didSet { applyAudioOutput() }
     }
     @Published var isTalking = false {
@@ -38,6 +37,7 @@ final class WalkieTalkie: ObservableObject {
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connection: NWConnection?
+    private var routeObserver: NSObjectProtocol?
     private var receivedData = Data()
     private var connected = false
     private var microphoneReady = false
@@ -49,6 +49,24 @@ final class WalkieTalkie: ObservableObject {
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playbackFormat)
         player.volume = 1
         audioEngine.mainMixerNode.outputVolume = 1
+
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.microphoneReady else { return }
+
+            do {
+                self.audioEngine.stop()
+                self.audioEngine.prepare()
+                try self.audioEngine.start()
+                self.player.play()
+                self.refreshCurrentRoute()
+            } catch {
+                self.status = "Błąd po zmianie wyjścia audio: \(error.localizedDescription)"
+            }
+        }
 
         AVAudioApplication.requestRecordPermission { [weak self] granted in
             DispatchQueue.main.async {
@@ -75,6 +93,7 @@ final class WalkieTalkie: ObservableObject {
                     try self.audioEngine.start()
                     self.player.play()
                     self.microphoneReady = true
+                    self.refreshCurrentRoute()
                 } catch {
                     self.status = "Błąd audio: \(error.localizedDescription)"
                 }
@@ -112,37 +131,29 @@ final class WalkieTalkie: ObservableObject {
         browser?.start(queue: .main)
     }
 
+    deinit {
+        if let routeObserver {
+            NotificationCenter.default.removeObserver(routeObserver)
+        }
+    }
+
     private func applyAudioOutput() {
         let session = AVAudioSession.sharedInstance()
         guard session.recordPermission == .granted else { return }
 
         do {
             try session.setActive(true)
-
-            switch audioOutput {
-            case .automatic:
-                try session.setPreferredInput(nil)
-                try session.overrideOutputAudioPort(.none)
-            case .speaker:
-                try session.setPreferredInput(nil)
-                try session.overrideOutputAudioPort(.speaker)
-            case .receiver:
-                try session.setPreferredInput(nil)
-                try session.overrideOutputAudioPort(.none)
-            case .bluetooth:
-                guard let bluetooth = session.availableInputs?.first(where: {
-                    $0.portType == .bluetoothHFP
-                }) else {
-                    status = "Brak podłączonego zestawu Bluetooth do rozmów"
-                    audioOutput = .automatic
-                    return
-                }
-                try session.setPreferredInput(bluetooth)
-                try session.overrideOutputAudioPort(.none)
-            }
+            try session.setPreferredInput(nil)
+            try session.overrideOutputAudioPort(audioOutput == .speaker ? .speaker : .none)
+            refreshCurrentRoute()
         } catch {
             status = "Błąd wyjścia audio: \(error.localizedDescription)"
         }
+    }
+
+    private func refreshCurrentRoute() {
+        let names = AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portName)
+        currentAudioRoute = "Wyjście audio: " + (names.isEmpty ? "brak" : names.joined(separator: ", "))
     }
 
     private func use(_ newConnection: NWConnection) {
@@ -246,7 +257,15 @@ final class WalkieTalkie: ObservableObject {
                             outputSamples[index] = max(-1, min(1, outputSamples[index] * gain))
                         }
 
-                        self.applyAudioOutput()
+                        if !self.audioEngine.isRunning {
+                            do {
+                                self.audioEngine.prepare()
+                                try self.audioEngine.start()
+                            } catch {
+                                self.status = "Błąd odtwarzania: \(error.localizedDescription)"
+                                continue
+                            }
+                        }
                         if !self.player.isPlaying {
                             self.player.play()
                         }
@@ -283,7 +302,6 @@ final class WalkieTalkie: ObservableObject {
 
         do {
             try AVAudioSession.sharedInstance().setActive(true)
-            applyAudioOutput()
             if !audioEngine.isRunning {
                 audioEngine.prepare()
                 try audioEngine.start()
