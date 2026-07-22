@@ -22,6 +22,7 @@ final class WalkieTalkie: ObservableObject {
     private var connection: NWConnection?
     private var receivedData = Data()
     private var connected = false
+    private var microphoneReady = false
     private var tapInstalled = false
     private let peerName = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
 
@@ -30,15 +31,30 @@ final class WalkieTalkie: ObservableObject {
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: nil)
         audioEngine.mainMixerNode.outputVolume = 1
 
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
-            try session.setPreferredSampleRate(48_000)
-            try session.setActive(true)
-            try audioEngine.start()
-            player.play()
-        } catch {
-            status = "Błąd audio: \(error.localizedDescription)"
+        AVAudioApplication.requestRecordPermission { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard granted else {
+                    self.status = "Brak dostępu do mikrofonu"
+                    return
+                }
+
+                do {
+                    let session = AVAudioSession.sharedInstance()
+                    try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+                    try session.setPreferredSampleRate(48_000)
+                    try session.setPreferredIOBufferDuration(0.02)
+                    try session.setActive(true)
+
+                    _ = self.audioEngine.inputNode
+                    self.audioEngine.prepare()
+                    try self.audioEngine.start()
+                    self.player.play()
+                    self.microphoneReady = true
+                } catch {
+                    self.status = "Błąd audio: \(error.localizedDescription)"
+                }
+            }
         }
 
         do {
@@ -162,15 +178,34 @@ final class WalkieTalkie: ObservableObject {
             return
         }
 
-        let input = audioEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            status = "Mikrofon nie jest gotowy"
+        guard microphoneReady else {
+            status = "Mikrofon nie jest jeszcze gotowy"
             isTalking = false
             return
         }
 
-        input.installTap(onBus: 0, bufferSize: 960, format: nil) { buffer, _ in
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            if !audioEngine.isRunning {
+                audioEngine.prepare()
+                try audioEngine.start()
+                player.play()
+            }
+        } catch {
+            status = "Błąd mikrofonu: \(error.localizedDescription)"
+            isTalking = false
+            return
+        }
+
+        let input = audioEngine.inputNode
+        let format = input.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            status = "Brak aktywnego wejścia mikrofonowego"
+            isTalking = false
+            return
+        }
+
+        input.installTap(onBus: 0, bufferSize: 960, format: format) { buffer, _ in
             guard let channel = buffer.floatChannelData?[0] else { return }
 
             let audio = Data(bytes: channel, count: Int(buffer.frameLength) * MemoryLayout<Float>.size)
