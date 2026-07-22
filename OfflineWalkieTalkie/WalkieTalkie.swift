@@ -17,6 +17,12 @@ final class WalkieTalkie: ObservableObject {
 
     private let audioEngine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    private let playbackFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 48_000,
+        channels: 1,
+        interleaved: false
+    )!
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connection: NWConnection?
@@ -28,7 +34,7 @@ final class WalkieTalkie: ObservableObject {
 
     init() {
         audioEngine.attach(player)
-        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: nil)
+        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playbackFormat)
         audioEngine.mainMixerNode.outputVolume = 1
 
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -137,23 +143,57 @@ final class WalkieTalkie: ObservableObject {
 
                         guard sampleRate > 0,
                               frameCount > 0,
-                              let format = AVAudioFormat(
+                              let sourceFormat = AVAudioFormat(
                                 commonFormat: .pcmFormatFloat32,
                                 sampleRate: Double(sampleRate),
                                 channels: 1,
                                 interleaved: false
                               ),
-                              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
+                              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount)
                         else { continue }
 
-                        buffer.frameLength = frameCount
-                        if let samples = buffer.floatChannelData?[0] {
-                            audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: samples, count: audio.count))
+                        sourceBuffer.frameLength = frameCount
+                        guard let sourceSamples = sourceBuffer.floatChannelData?[0] else { continue }
+                        audio.copyBytes(to: UnsafeMutableRawBufferPointer(start: sourceSamples, count: audio.count))
+
+                        let ratio = self.playbackFormat.sampleRate / sourceFormat.sampleRate
+                        let outputCapacity = AVAudioFrameCount((Double(frameCount) * ratio).rounded(.up)) + 1
+                        guard let outputBuffer = AVAudioPCMBuffer(
+                            pcmFormat: self.playbackFormat,
+                            frameCapacity: outputCapacity
+                        ) else { continue }
+
+                        if sourceFormat.sampleRate == self.playbackFormat.sampleRate {
+                            outputBuffer.frameLength = frameCount
+                            guard let outputSamples = outputBuffer.floatChannelData?[0] else { continue }
                             for index in 0..<Int(frameCount) {
-                                samples[index] = max(-1, min(1, samples[index] * 1.8))
+                                outputSamples[index] = max(-1, min(1, sourceSamples[index] * 1.8))
                             }
-                            self.player.scheduleBuffer(buffer)
+                        } else {
+                            guard let converter = AVAudioConverter(from: sourceFormat, to: self.playbackFormat) else { continue }
+                            var supplied = false
+                            var conversionError: NSError?
+                            let result = converter.convert(to: outputBuffer, error: &conversionError) { _, status in
+                                if supplied {
+                                    status.pointee = .endOfStream
+                                    return nil
+                                }
+                                supplied = true
+                                status.pointee = .haveData
+                                return sourceBuffer
+                            }
+                            guard result != .error, conversionError == nil,
+                                  let outputSamples = outputBuffer.floatChannelData?[0]
+                            else { continue }
+                            for index in 0..<Int(outputBuffer.frameLength) {
+                                outputSamples[index] = max(-1, min(1, outputSamples[index] * 1.8))
+                            }
                         }
+
+                        if !self.player.isPlaying {
+                            self.player.play()
+                        }
+                        self.player.scheduleBuffer(outputBuffer)
                     }
                 }
 
