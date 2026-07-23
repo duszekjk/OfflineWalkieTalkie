@@ -5,7 +5,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var walkieTalkie: WalkieTalkie
     @State private var mapPosition: MapCameraPosition = .automatic
-    @State private var showDeviceSettings = false
+    @State private var showColorPicker = false
     @State private var talkButtonOpacity = 1.0
 
     private let colors: [Color] = [.blue, .red, .green, .orange, .purple, .pink, .teal, .yellow]
@@ -40,9 +40,9 @@ struct ContentView: View {
 
                                 Text(device.name)
                                     .font(.caption.bold())
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(.thinMaterial, in: Capsule())
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .glassEffect(.regular, in: .capsule)
                             }
                         }
                     }
@@ -55,40 +55,57 @@ struct ContentView: View {
             .ignoresSafeArea()
 
             VStack(spacing: 10) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(walkieTalkie.status)
-                            .font(.headline)
+                GlassEffectContainer(spacing: 10) {
+                    VStack(spacing: 10) {
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(colors[walkieTalkie.deviceColorIndex % colors.count])
+                                .frame(width: 14, height: 14)
 
-                        if walkieTalkie.remoteDevices.isEmpty {
-                            Text("Brak połączonych urządzeń")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text(walkieTalkie.remoteDevices.map(\.name).joined(separator: ", "))
+                            TextField("Nazwa tego urządzenia", text: $walkieTalkie.deviceName)
+                                .font(.headline)
+                                .textFieldStyle(.plain)
+                                .submitLabel(.done)
+
+                            Button {
+                                showColorPicker = true
+                            } label: {
+                                Image(systemName: "paintpalette")
+                                    .frame(width: 34, height: 34)
+                            }
+                            .buttonStyle(.glass)
+                        }
+                        .padding(.leading, 16)
+                        .padding(.trailing, 6)
+                        .padding(.vertical, 6)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(walkieTalkie.status)
+                                    .font(.subheadline.weight(.semibold))
+
+                                Text(
+                                    walkieTalkie.remoteDevices.isEmpty
+                                    ? "Brak połączonych urządzeń"
+                                    : walkieTalkie.remoteDevices.map(\.name).joined(separator: ", ")
+                                )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
+                            }
+
+                            Spacer(minLength: 8)
+
+                            AudioRoutePicker()
+                                .frame(width: 36, height: 36)
                         }
+                        .padding(.leading, 16)
+                        .padding(.trailing, 10)
+                        .padding(.vertical, 8)
+                        .glassEffect(.regular, in: .capsule)
                     }
-
-                    Spacer()
-
-                    Button {
-                        showDeviceSettings = true
-                    } label: {
-                        Image(systemName: "person.crop.circle.badge.gearshape")
-                            .font(.title3)
-                            .frame(width: 42, height: 42)
-                    }
-                    .buttonStyle(.plain)
-
-                    AudioRoutePicker()
-                        .frame(width: 42, height: 42)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .glassPanel()
 
                 HStack {
                     Spacer()
@@ -98,11 +115,9 @@ struct ContentView: View {
                         }
                     } label: {
                         Image(systemName: "scope")
-                            .font(.title3)
                             .frame(width: 44, height: 44)
                     }
-                    .buttonStyle(.plain)
-                    .glassPanel()
+                    .buttonStyle(.glass)
                 }
 
                 Spacer()
@@ -132,8 +147,8 @@ struct ContentView: View {
                     )
                     .padding(.bottom, 18)
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 6)
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
         }
         .task {
             try? await Task.sleep(for: .seconds(5))
@@ -141,51 +156,42 @@ struct ContentView: View {
                 talkButtonOpacity = 0.08
             }
         }
-        .sheet(isPresented: $showDeviceSettings) {
+        .sheet(isPresented: $showColorPicker) {
             NavigationStack {
-                Form {
-                    Section("Urządzenie") {
-                        TextField("Nazwa urządzenia", text: $walkieTalkie.deviceName)
+                VStack(spacing: 24) {
+                    Text("Kolor urządzenia")
+                        .font(.title2.bold())
 
-                        HStack {
-                            ForEach(colors.indices, id: \.self) { index in
-                                Circle()
-                                    .fill(colors[index])
-                                    .frame(width: 30, height: 30)
-                                    .overlay {
-                                        if walkieTalkie.deviceColorIndex == index {
-                                            Image(systemName: "checkmark")
-                                                .font(.caption.bold())
-                                                .foregroundStyle(.white)
-                                        }
+                    HStack(spacing: 14) {
+                        ForEach(colors.indices, id: \.self) { index in
+                            Circle()
+                                .fill(colors[index])
+                                .frame(width: 34, height: 34)
+                                .overlay {
+                                    if walkieTalkie.deviceColorIndex == index {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption.bold())
+                                            .foregroundStyle(.white)
                                     }
-                                    .onTapGesture {
-                                        walkieTalkie.deviceColorIndex = index
-                                    }
-                            }
+                                }
+                                .onTapGesture {
+                                    walkieTalkie.deviceColorIndex = index
+                                }
                         }
                     }
+
+                    Spacer()
                 }
-                .navigationTitle("To urządzenie")
+                .padding()
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Gotowe") {
-                            showDeviceSettings = false
+                            showColorPicker = false
                         }
                     }
                 }
             }
-        }
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func glassPanel() -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular, in: .rect(cornerRadius: 22))
-        } else {
-            self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22))
+            .presentationDetents([.medium])
         }
     }
 }
