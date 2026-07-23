@@ -50,13 +50,18 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                     audioEngine.inputNode.removeTap(onBus: 0)
                     tapInstalled = false
                 }
-                sendTalkState(false)
+                sendPacket(type: 5, payload: Data([0]))
             }
         }
     }
 
     var devicesForMap: [ConnectedDevice] {
-        [ConnectedDevice(id: deviceID, name: deviceName, colorIndex: deviceColorIndex, locations: localLocations)] + remoteDevices
+        [ConnectedDevice(
+            id: deviceID,
+            name: deviceName,
+            colorIndex: deviceColorIndex,
+            locations: localLocations
+        )] + remoteDevices
     }
 
     private struct AudioBufferState {
@@ -70,11 +75,6 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
         let id: String
         let name: String
         let colorIndex: Int
-    }
-
-    private struct LocationUpdate: Codable {
-        let id: String
-        let points: [LocationPoint]
     }
 
     private let audioEngine = AVAudioEngine()
@@ -112,13 +112,10 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
     private var peerEndpoint: NWEndpoint?
     private var receivedData = Data()
     private var connected = false
-    private var remoteTalking = false
     private var microphoneReady = false
     private var tapInstalled = false
     private var sequence: UInt32 = 0
     private var lastReceived = Date()
-    private var lastLocationSync = Date.distantPast
-    private var sentLocationCount = 0
     private var reconnectTimer: Timer?
     private let deviceID = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
     private let parameters: NWParameters
@@ -190,24 +187,8 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
             if self.connected {
                 if Date().timeIntervalSince(self.lastReceived) > 4 {
                     self.resetConnection()
-                    return
-                }
-
-                self.sendPacket(type: 2)
-
-                if !self.isTalking,
-                   !self.remoteTalking,
-                   Date().timeIntervalSince(self.lastLocationSync) >= 60,
-                   self.sentLocationCount < self.localLocations.count {
-                    let update = LocationUpdate(
-                        id: self.deviceID,
-                        points: Array(self.localLocations[self.sentLocationCount...])
-                    )
-                    if let data = try? JSONEncoder().encode(update) {
-                        self.sendPacket(type: 4, payload: data)
-                        self.sentLocationCount = self.localLocations.count
-                        self.lastLocationSync = Date()
-                    }
+                } else {
+                    self.sendPacket(type: 2)
                 }
                 return
             }
@@ -227,8 +208,10 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                 DispatchQueue.main.async {
                     guard let self, let browser, self.browser === browser else { return }
                     self.peerEndpoint = nil
+
                     for result in results {
-                        if case let .service(name, _, _, _) = result.endpoint, self.deviceID < name {
+                        if case let .service(name, _, _, _) = result.endpoint,
+                           self.deviceID < name {
                             self.peerEndpoint = result.endpoint
                             if self.connection == nil {
                                 self.use(NWConnection(to: result.endpoint, using: self.parameters))
@@ -256,35 +239,46 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        if manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
+        if manager.authorizationStatus == .authorizedWhenInUse ||
+            manager.authorizationStatus == .authorizedAlways {
             manager.startUpdatingLocation()
         }
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.last, location.horizontalAccuracy >= 0 else { return }
+
         if let previous = localLocations.last {
-            let previousLocation = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
-            guard location.distance(from: previousLocation) >= 20 || location.timestamp.timeIntervalSince(previous.date) >= 60 else { return }
+            let previousLocation = CLLocation(
+                latitude: previous.latitude,
+                longitude: previous.longitude
+            )
+            guard location.distance(from: previousLocation) >= 20 ||
+                    location.timestamp.timeIntervalSince(previous.date) >= 60 else {
+                return
+            }
         }
+
         localLocations.append(LocationPoint(location))
         if localLocations.count > 300 {
             localLocations.removeFirst(localLocations.count - 300)
-            sentLocationCount = min(sentLocationCount, localLocations.count)
         }
     }
 
     private func sendPacket(type: UInt8, payload: Data = Data()) {
         guard let connection, connected else { return }
+
         var body = Data([type])
         var packetSequence = sequence.bigEndian
         sequence &+= 1
         body.append(Data(bytes: &packetSequence, count: 4))
         body.append(payload)
+
         guard body.count <= Int(UInt16.max) else { return }
         var length = UInt16(body.count).bigEndian
         var packet = Data(bytes: &length, count: 2)
         packet.append(body)
+
         connection.send(content: packet, completion: .contentProcessed { [weak self] error in
             if error != nil {
                 DispatchQueue.main.async {
@@ -301,16 +295,11 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
         sendPacket(type: 3, payload: data)
     }
 
-    private func sendTalkState(_ talking: Bool) {
-        sendPacket(type: 5, payload: Data([talking ? 1 : 0]))
-    }
-
     private func resetConnection() {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
         connected = false
-        remoteTalking = false
         receivedData.removeAll(keepingCapacity: true)
         peerEndpoint = nil
         browser?.cancel()
@@ -334,6 +323,7 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             DispatchQueue.main.async {
                 guard let self, let newConnection, self.connection === newConnection else { return }
+
                 switch state {
                 case .ready:
                     self.connected = true
@@ -355,16 +345,24 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
         newConnection.start(queue: .main)
 
         func receive() {
-            newConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak newConnection] data, _, complete, error in
-                guard let self, let newConnection, self.connection === newConnection else { return }
+            newConnection.receive(
+                minimumIncompleteLength: 1,
+                maximumLength: 65_536
+            ) { [weak self, weak newConnection] data, _, complete, error in
+                guard let self,
+                      let newConnection,
+                      self.connection === newConnection else { return }
 
                 if let data {
                     self.lastReceived = Date()
                     self.receivedData.append(data)
 
                     while self.receivedData.count >= 2 {
-                        let length = self.receivedData.prefix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
+                        let length = self.receivedData.prefix(2).reduce(UInt16(0)) {
+                            ($0 << 8) | UInt16($1)
+                        }
                         guard self.receivedData.count >= 2 + Int(length) else { break }
+
                         let packet = self.receivedData.subdata(in: 2..<(2 + Int(length)))
                         self.receivedData.removeSubrange(0..<(2 + Int(length)))
                         guard packet.count >= 5 else { continue }
@@ -377,19 +375,24 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                                 payload.withUnsafeBytes { rawBuffer in
                                     let input = rawBuffer.bindMemory(to: Int16.self)
                                     var squareSum: Float = 0
+
                                     for sample in input {
                                         let value = Float(Int16(littleEndian: sample)) / Float(Int16.max)
                                         squareSum += value * value
                                     }
+
                                     let rms = sqrt(squareSum / Float(max(1, input.count)))
                                     let gain = rms > 0.0001 ? min(45, max(2.2, 0.45 / rms)) : 1
+
                                     for sample in input {
                                         let value = Float(Int16(littleEndian: sample)) / Float(Int16.max)
                                         let amplified = tanh(value * gain * 1.3)
+
                                         if state.count == state.samples.count {
                                             state.readIndex = (state.readIndex + 1) % state.samples.count
                                             state.count -= 1
                                         }
+
                                         state.samples[state.writeIndex] = amplified
                                         state.writeIndex = (state.writeIndex + 1) % state.samples.count
                                         state.count += 1
@@ -397,7 +400,10 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                                 }
                             }
                         } else if type == 3,
-                                  let identity = try? JSONDecoder().decode(Identity.self, from: Data(payload)) {
+                                  let identity = try? JSONDecoder().decode(
+                                    Identity.self,
+                                    from: Data(payload)
+                                  ) {
                             if let index = self.remoteDevices.firstIndex(where: { $0.id == identity.id }) {
                                 self.remoteDevices[index].name = identity.name
                                 self.remoteDevices[index].colorIndex = identity.colorIndex
@@ -409,17 +415,6 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                                     locations: []
                                 ))
                             }
-                        } else if type == 4,
-                                  let update = try? JSONDecoder().decode(LocationUpdate.self, from: Data(payload)) {
-                            if let index = self.remoteDevices.firstIndex(where: { $0.id == update.id }) {
-                                let known = Set(self.remoteDevices[index].locations.map(\.id))
-                                self.remoteDevices[index].locations.append(contentsOf: update.points.filter { !known.contains($0.id) })
-                                if self.remoteDevices[index].locations.count > 300 {
-                                    self.remoteDevices[index].locations.removeFirst(self.remoteDevices[index].locations.count - 300)
-                                }
-                            }
-                        } else if type == 5, let value = payload.first {
-                            self.remoteTalking = value == 1
                         }
                     }
                 }
@@ -462,7 +457,8 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
             return
         }
 
-        sendTalkState(true)
+        sendPacket(type: 5, payload: Data([1]))
+
         let input = audioEngine.inputNode
         let format = input.inputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -479,10 +475,12 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
             guard let self,
                   let connection,
                   self.connection === connection,
-                  let channel = buffer.floatChannelData?[0]
-            else { return }
+                  let channel = buffer.floatChannelData?[0] else { return }
 
-            let outputCount = max(1, Int((Double(buffer.frameLength) * 16_000 / buffer.format.sampleRate).rounded()))
+            let outputCount = max(
+                1,
+                Int((Double(buffer.frameLength) * 16_000 / buffer.format.sampleRate).rounded())
+            )
             var samples = [Int16](repeating: 0, count: outputCount)
             let scale = buffer.format.sampleRate / 16_000
 
@@ -500,9 +498,11 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
             self.sequence &+= 1
             body.append(Data(bytes: &packetSequence, count: 4))
             samples.withUnsafeBytes { body.append(contentsOf: $0) }
+
             var length = UInt16(body.count).bigEndian
             var packet = Data(bytes: &length, count: 2)
             packet.append(body)
+
             connection.send(content: packet, completion: .contentProcessed { [weak self] error in
                 if error != nil {
                     DispatchQueue.main.async {
