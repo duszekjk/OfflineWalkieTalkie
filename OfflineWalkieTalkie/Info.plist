@@ -21,6 +21,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_offlinewalkie._tcp</string>
+		<string>_offlinechat._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Aplikacja łączy się bezpośrednio z pobliskimi iPhone’ami.</string>
