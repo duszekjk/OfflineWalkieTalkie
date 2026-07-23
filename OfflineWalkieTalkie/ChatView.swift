@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ChatView: View {
     @EnvironmentObject private var chat: ChatManager
-    let close: () -> Void
 
     @State private var text = ""
     @State private var locationToOpen: ChatMessage?
@@ -11,6 +10,29 @@ struct ChatView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                Picker("Tryb", selection: $chat.appMode) {
+                    ForEach(AppMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(6)
+                .glassEffect(.regular.interactive(), in: .capsule)
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                HStack {
+                    Circle()
+                        .fill(chat.connected ? Color.green : Color.gray)
+                        .frame(width: 8, height: 8)
+                    Text(chat.connected ? "Czat połączony" : "Szukam urządzenia do czatu…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 10) {
@@ -64,7 +86,7 @@ struct ChatView: View {
                             .frame(width: 40, height: 40)
                     }
                     .buttonStyle(.glass)
-                    .disabled(chat.currentLocation == nil)
+                    .disabled(chat.currentLocation == nil || !chat.connected)
 
                     TextField("Wiadomość", text: $text, axis: .vertical)
                         .lineLimit(1...4)
@@ -81,15 +103,12 @@ struct ChatView: View {
                             .frame(width: 40, height: 40)
                     }
                     .buttonStyle(.glassProminent)
-                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !chat.connected)
                 }
                 .padding()
             }
             .navigationTitle("Czat")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Audio", action: close)
-                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
