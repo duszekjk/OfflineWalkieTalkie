@@ -26,6 +26,8 @@
 	<string>Aplikacja łączy się bezpośrednio z pobliskimi iPhone’ami.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Mikrofon jest potrzebny do przesyłania głosu na żywo.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Lokalizacja jest używana do pokazywania pozycji i trasy połączonych urządzeń na mapie.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
