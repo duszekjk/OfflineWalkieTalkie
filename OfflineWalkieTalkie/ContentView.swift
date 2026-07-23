@@ -22,20 +22,12 @@ struct ContentView: View {
                     }
 
                     if let location = device.locations.last {
-                        Annotation(
-                            device.name,
-                            coordinate: CLLocationCoordinate2D(
-                                latitude: location.latitude,
-                                longitude: location.longitude
-                            )
-                        ) {
+                        Annotation(device.name, coordinate: CLLocationCoordinate2D(latitude: location.latitude, longitude: location.longitude)) {
                             VStack(spacing: 4) {
                                 Circle()
                                     .fill(colors[device.colorIndex % colors.count])
                                     .frame(width: 18, height: 18)
-                                    .overlay {
-                                        Circle().stroke(.white, lineWidth: 3)
-                                    }
+                                    .overlay { Circle().stroke(.white, lineWidth: 3) }
                                     .shadow(radius: 4)
 
                                 Text(device.name)
@@ -57,6 +49,15 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 GlassEffectContainer(spacing: 10) {
                     VStack(spacing: 10) {
+                        Picker("Tryb", selection: $walkieTalkie.mode) {
+                            ForEach(CommunicationMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .padding(6)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+
                         HStack(spacing: 10) {
                             Circle()
                                 .fill(colors[walkieTalkie.deviceColorIndex % colors.count])
@@ -67,9 +68,7 @@ struct ContentView: View {
                                 .textFieldStyle(.plain)
                                 .submitLabel(.done)
 
-                            Button {
-                                showColorPicker = true
-                            } label: {
+                            Button { showColorPicker = true } label: {
                                 Image(systemName: "paintpalette")
                                     .frame(width: 34, height: 34)
                             }
@@ -82,7 +81,7 @@ struct ContentView: View {
 
                         HStack(spacing: 10) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(walkieTalkie.status)
+                                Text(walkieTalkie.callActive ? "Rozmowa aktywna" : walkieTalkie.status)
                                     .font(.subheadline.weight(.semibold))
 
                                 Text(
@@ -110,9 +109,7 @@ struct ContentView: View {
                 HStack {
                     Spacer()
                     Button {
-                        withAnimation {
-                            mapPosition = .automatic
-                        }
+                        withAnimation { mapPosition = .automatic }
                     } label: {
                         Image(systemName: "scope")
                             .frame(width: 44, height: 44)
@@ -122,39 +119,71 @@ struct ContentView: View {
 
                 Spacer()
 
-                Circle()
-                    .fill(walkieTalkie.isTalking ? Color.red : Color.blue)
-                    .frame(width: 280, height: 280)
-                    .overlay {
-                        Text(walkieTalkie.isTalking ? "MÓW" : "PRZYTRZYMAJ\nABY MÓWIĆ")
-                            .font(.title.bold())
-                            .foregroundStyle(.white)
-                            .multilineTextAlignment(.center)
-                    }
-                    .scaleEffect(walkieTalkie.isTalking ? 1.05 : 1)
-                    .opacity(walkieTalkie.isTalking ? 1 : talkButtonOpacity)
-                    .animation(.easeOut(duration: 0.12), value: walkieTalkie.isTalking)
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { _ in
-                                if !walkieTalkie.isTalking {
-                                    walkieTalkie.isTalking = true
+                if walkieTalkie.mode == .walkieTalkie {
+                    Circle()
+                        .fill(walkieTalkie.isTalking ? Color.red : Color.blue)
+                        .frame(width: 280, height: 280)
+                        .overlay {
+                            Text(walkieTalkie.isTalking ? "MÓW" : "PRZYTRZYMAJ\nABY MÓWIĆ")
+                                .font(.title.bold())
+                                .foregroundStyle(.white)
+                                .multilineTextAlignment(.center)
+                        }
+                        .scaleEffect(walkieTalkie.isTalking ? 1.05 : 1)
+                        .opacity(walkieTalkie.isTalking ? 1 : talkButtonOpacity)
+                        .animation(.easeOut(duration: 0.12), value: walkieTalkie.isTalking)
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { _ in
+                                    if !walkieTalkie.isTalking { walkieTalkie.isTalking = true }
                                 }
+                                .onEnded { _ in walkieTalkie.isTalking = false }
+                        )
+                        .padding(.bottom, 18)
+                } else {
+                    VStack(spacing: 16) {
+                        Button {
+                            walkieTalkie.callActive.toggle()
+                        } label: {
+                            Circle()
+                                .fill(walkieTalkie.callActive ? Color.red : Color.green)
+                                .frame(width: 220, height: 220)
+                                .overlay {
+                                    VStack(spacing: 12) {
+                                        Image(systemName: walkieTalkie.callActive ? "phone.down.fill" : "phone.fill")
+                                            .font(.system(size: 44, weight: .bold))
+                                        Text(walkieTalkie.callActive ? "ZAKOŃCZ" : "ROZPOCZNIJ\nROZMOWĘ")
+                                            .font(.title2.bold())
+                                            .multilineTextAlignment(.center)
+                                    }
+                                    .foregroundStyle(.white)
+                                }
+                        }
+                        .buttonStyle(.plain)
+
+                        if walkieTalkie.callActive {
+                            Button {
+                                walkieTalkie.microphoneMuted.toggle()
+                            } label: {
+                                Label(
+                                    walkieTalkie.microphoneMuted ? "Włącz mikrofon" : "Wycisz mikrofon",
+                                    systemImage: walkieTalkie.microphoneMuted ? "mic.slash.fill" : "mic.fill"
+                                )
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
                             }
-                            .onEnded { _ in
-                                walkieTalkie.isTalking = false
-                            }
-                    )
+                            .buttonStyle(.glass)
+                        }
+                    }
                     .padding(.bottom, 18)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.top, 4)
         }
         .task {
             try? await Task.sleep(for: .seconds(5))
-            withAnimation(.easeInOut(duration: 2)) {
-                talkButtonOpacity = 0.08
-            }
+            withAnimation(.easeInOut(duration: 2)) { talkButtonOpacity = 0.08 }
         }
         .sheet(isPresented: $showColorPicker) {
             NavigationStack {
@@ -174,20 +203,15 @@ struct ContentView: View {
                                             .foregroundStyle(.white)
                                     }
                                 }
-                                .onTapGesture {
-                                    walkieTalkie.deviceColorIndex = index
-                                }
+                                .onTapGesture { walkieTalkie.deviceColorIndex = index }
                         }
                     }
-
                     Spacer()
                 }
                 .padding()
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
-                        Button("Gotowe") {
-                            showColorPicker = false
-                        }
+                        Button("Gotowe") { showColorPicker = false }
                     }
                 }
             }
