@@ -50,7 +50,12 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                     audioEngine.inputNode.removeTap(onBus: 0)
                     tapInstalled = false
                 }
-                sendPacket(type: 5, payload: Data([0]))
+                preRoll.removeAll(keepingCapacity: true)
+                silentFrameCount = 0
+                if localAudioActive {
+                    localAudioActive = false
+                    sendPacket(type: 5, payload: Data([0]))
+                }
             }
         }
     }
@@ -118,6 +123,7 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
     private var receivedData = Data()
     private var connected = false
     private var remoteTalking = false
+    private var localAudioActive = false
     private var microphoneReady = false
     private var tapInstalled = false
     private var sequence: UInt32 = 0
@@ -125,6 +131,8 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
     private var lastLocationSync = Date.distantPast
     private var sentLocationCount = 0
     private var reconnectTimer: Timer?
+    private var silentFrameCount = 0
+    private var preRoll: [[Int16]] = []
     private let deviceID = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
     private let parameters: NWParameters
 
@@ -160,13 +168,13 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                     let session = AVAudioSession.sharedInstance()
                     try session.setCategory(
                         .playAndRecord,
-                        mode: .videoChat,
+                        mode: .voiceChat,
                         options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
                     )
                     try session.setPreferredSampleRate(48_000)
                     try session.setPreferredIOBufferDuration(0.005)
                     try session.setActive(true)
-                    _ = self.audioEngine.inputNode
+                    try self.audioEngine.inputNode.setVoiceProcessingEnabled(true)
                     self.audioEngine.prepare()
                     try self.audioEngine.start()
                     self.microphoneReady = true
@@ -200,7 +208,7 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
 
                 self.sendPacket(type: 2)
 
-                if !self.isTalking,
+                if !self.localAudioActive,
                    !self.remoteTalking,
                    Date().timeIntervalSince(self.lastLocationSync) >= 60,
                    self.sentLocationCount < self.localLocations.count {
@@ -294,7 +302,7 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
 
     private func sendPacket(type: UInt8, payload: Data = Data()) {
         guard let connection, connected else { return }
-        if type == 4 && (isTalking || remoteTalking) { return }
+        if type == 4 && (localAudioActive || remoteTalking) { return }
 
         var body = Data([type])
         var packetSequence = sequence.bigEndian
@@ -329,6 +337,7 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
         connection = nil
         connected = false
         remoteTalking = false
+        localAudioActive = false
         receivedData.removeAll(keepingCapacity: true)
         peerEndpoint = nil
         browser?.cancel()
@@ -336,6 +345,8 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
         remoteDevices.removeAll()
         sentLocationCount = 0
         lastLocationSync = .distantPast
+        preRoll.removeAll(keepingCapacity: true)
+        silentFrameCount = 0
         audioBuffer.withLock { state in
             state.readIndex = 0
             state.writeIndex = 0
@@ -402,7 +413,6 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                         let payload = packet.dropFirst(5)
 
                         if type == 0 {
-                            self.remoteTalking = true
                             self.audioBuffer.withLock { state in
                                 payload.withUnsafeBytes { rawBuffer in
                                     let input = rawBuffer.bindMemory(to: Int16.self)
@@ -507,7 +517,9 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
             return
         }
 
-        sendPacket(type: 5, payload: Data([1]))
+        localAudioActive = false
+        silentFrameCount = 0
+        preRoll.removeAll(keepingCapacity: true)
 
         let input = audioEngine.inputNode
         let format = input.inputFormat(forBus: 0)
@@ -527,6 +539,12 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                   self.connection === connection,
                   let channel = buffer.floatChannelData?[0] else { return }
 
+            var squareSum: Float = 0
+            for index in 0..<Int(buffer.frameLength) {
+                squareSum += channel[index] * channel[index]
+            }
+            let rms = sqrt(squareSum / Float(max(1, buffer.frameLength)))
+
             let outputCount = max(
                 1,
                 Int((Double(buffer.frameLength) * 16_000 / buffer.format.sampleRate).rounded())
@@ -543,16 +561,40 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                 samples[index] = Int16(max(-1, min(1, sample)) * Float(Int16.max))
             }
 
+            self.preRoll.append(samples)
+            if self.preRoll.count > 5 {
+                self.preRoll.removeFirst()
+            }
+
+            if !self.localAudioActive {
+                guard rms >= 0.006 else { return }
+                self.localAudioActive = true
+                self.silentFrameCount = 0
+                self.sendPacket(type: 5, payload: Data([1]))
+
+                for bufferedSamples in self.preRoll {
+                    var body = Data([0])
+                    var packetSequence = self.sequence.bigEndian
+                    self.sequence &+= 1
+                    body.append(Data(bytes: &packetSequence, count: 4))
+                    bufferedSamples.withUnsafeBytes { body.append(contentsOf: $0) }
+                    var length = UInt16(body.count).bigEndian
+                    var packet = Data(bytes: &length, count: 2)
+                    packet.append(body)
+                    connection.send(content: packet, completion: .contentProcessed { _ in })
+                }
+                self.preRoll.removeAll(keepingCapacity: true)
+                return
+            }
+
             var body = Data([0])
             var packetSequence = self.sequence.bigEndian
             self.sequence &+= 1
             body.append(Data(bytes: &packetSequence, count: 4))
             samples.withUnsafeBytes { body.append(contentsOf: $0) }
-
             var length = UInt16(body.count).bigEndian
             var packet = Data(bytes: &length, count: 2)
             packet.append(body)
-
             connection.send(content: packet, completion: .contentProcessed { [weak self] error in
                 if error != nil {
                     DispatchQueue.main.async {
@@ -560,6 +602,18 @@ final class WalkieTalkie: NSObject, ObservableObject, CLLocationManagerDelegate 
                     }
                 }
             })
+
+            if rms < 0.003 {
+                self.silentFrameCount += 1
+                if self.silentFrameCount >= 30 {
+                    self.localAudioActive = false
+                    self.silentFrameCount = 0
+                    self.preRoll.removeAll(keepingCapacity: true)
+                    self.sendPacket(type: 5, payload: Data([0]))
+                }
+            } else {
+                self.silentFrameCount = 0
+            }
         }
         tapInstalled = true
     }
