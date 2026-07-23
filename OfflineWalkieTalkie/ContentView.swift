@@ -4,7 +4,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var walkieTalkie: WalkieTalkie
-    let openChat: () -> Void
+    @EnvironmentObject private var chat: ChatManager
 
     @State private var mapPosition: MapCameraPosition = .automatic
     @State private var showColorPicker = false
@@ -51,21 +51,12 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 GlassEffectContainer(spacing: 10) {
                     VStack(spacing: 10) {
-                        HStack(spacing: 8) {
-                            Picker("Tryb", selection: $walkieTalkie.mode) {
-                                ForEach(CommunicationMode.allCases) { mode in
-                                    Text(mode.rawValue).tag(mode)
-                                }
+                        Picker("Tryb", selection: $chat.appMode) {
+                            ForEach(AppMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
                             }
-                            .pickerStyle(.segmented)
-
-                            Button(action: openChat) {
-                                Label("Czat", systemImage: "message.fill")
-                                    .labelStyle(.iconOnly)
-                                    .frame(width: 36, height: 36)
-                            }
-                            .buttonStyle(.glass)
                         }
+                        .pickerStyle(.segmented)
                         .padding(6)
                         .glassEffect(.regular.interactive(), in: .capsule)
 
@@ -130,7 +121,7 @@ struct ContentView: View {
 
                 Spacer()
 
-                if walkieTalkie.mode == .walkieTalkie {
+                if chat.appMode == .walkieTalkie {
                     Circle()
                         .fill(walkieTalkie.isTalking ? Color.red : Color.blue)
                         .frame(width: 280, height: 280)
@@ -191,6 +182,16 @@ struct ContentView: View {
             }
             .padding(.horizontal, 12)
             .padding(.top, 4)
+        }
+        .onAppear {
+            walkieTalkie.mode = chat.appMode == .call ? .call : .walkieTalkie
+        }
+        .onChange(of: chat.appMode) { _, mode in
+            if mode == .walkieTalkie {
+                walkieTalkie.mode = .walkieTalkie
+            } else if mode == .call {
+                walkieTalkie.mode = .call
+            }
         }
         .task {
             try? await Task.sleep(for: .seconds(5))
