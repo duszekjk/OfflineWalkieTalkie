@@ -1,3 +1,4 @@
+import AudioToolbox
 import CoreLocation
 import Foundation
 import Network
@@ -48,6 +49,10 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         didSet { UserDefaults.standard.set(preferredMapsApp.rawValue, forKey: "preferredMapsApp") }
     }
 
+    var localName: String {
+        UserDefaults.standard.string(forKey: "deviceName") ?? UIDevice.current.name
+    }
+
     private struct ChatPacket: Codable {
         enum Kind: String, Codable {
             case message
@@ -59,6 +64,11 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         let message: ChatMessage?
         let mode: AppMode?
         let messages: [ChatMessage]?
+    }
+
+    private struct SavedDevice: Decodable {
+        let name: String
+        let colorIndex: Int
     }
 
     private let locationManager = CLLocationManager()
@@ -113,6 +123,19 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         reconnectTimer?.invalidate()
     }
 
+    func colorIndex(for sender: String) -> Int {
+        if normalizedName(sender) == normalizedName(localName) {
+            return UserDefaults.standard.object(forKey: "deviceColorIndex") as? Int ?? 0
+        }
+
+        guard let data = UserDefaults.standard.data(forKey: "remoteDevices"),
+              let devices = try? JSONDecoder().decode([SavedDevice].self, from: data),
+              let device = devices.first(where: { normalizedName($0.name) == normalizedName(sender) }) else {
+            return 0
+        }
+        return device.colorIndex
+    }
+
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         if manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
             manager.startUpdatingLocation()
@@ -129,7 +152,7 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
         let message = ChatMessage(
             id: UUID(),
-            sender: UserDefaults.standard.string(forKey: "deviceName") ?? UIDevice.current.name,
+            sender: localName,
             date: Date(),
             kind: .text,
             text: value,
@@ -145,7 +168,7 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
         let message = ChatMessage(
             id: UUID(),
-            sender: UserDefaults.standard.string(forKey: "deviceName") ?? UIDevice.current.name,
+            sender: localName,
             date: Date(),
             kind: .location,
             text: "Udostępniona lokalizacja",
@@ -172,14 +195,20 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
 
-    private func append(_ message: ChatMessage) {
-        guard !messages.contains(where: { $0.id == message.id }) else { return }
+    @discardableResult
+    private func append(_ message: ChatMessage) -> Bool {
+        guard !messages.contains(where: { $0.id == message.id }) else { return false }
         messages.append(message)
         messages.sort { $0.date < $1.date }
         if messages.count > 1_000 { messages.removeFirst(messages.count - 1_000) }
         if let data = try? JSONEncoder().encode(messages) {
             UserDefaults.standard.set(data, forKey: "chatMessages")
         }
+        return true
+    }
+
+    private func normalizedName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func send(_ value: ChatPacket) {
@@ -255,8 +284,10 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
                         guard let packet = try? JSONDecoder().decode(ChatPacket.self, from: payload) else { continue }
                         DispatchQueue.main.async {
-                            if let message = packet.message {
-                                self.append(message)
+                            if let message = packet.message,
+                               self.append(message),
+                               self.normalizedName(message.sender) != self.normalizedName(self.localName) {
+                                AudioServicesPlaySystemSound(1007)
                             }
                             if let history = packet.messages {
                                 for message in history { self.append(message) }
