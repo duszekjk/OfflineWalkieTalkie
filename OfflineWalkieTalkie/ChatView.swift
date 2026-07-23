@@ -7,6 +7,8 @@ struct ChatView: View {
     @State private var locationToOpen: ChatMessage?
     @State private var showSettings = false
 
+    private let colors: [Color] = [.blue, .red, .green, .orange, .purple, .pink, .teal, .yellow]
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -35,41 +37,77 @@ struct ChatView: View {
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 10) {
+                        LazyVStack(spacing: 8) {
                             ForEach(chat.messages) { message in
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(message.sender)
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.secondary)
+                                let ownMessage = message.sender.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == chat.localName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                                let colorIndex = chat.colorIndex(for: message.sender) % colors.count
 
-                                    if message.kind == .location {
-                                        Button {
-                                            if chat.preferredMapsApp == .ask {
-                                                locationToOpen = message
-                                            } else {
-                                                chat.openLocation(message)
-                                            }
-                                        } label: {
-                                            Label("Otwórz udostępnioną lokalizację", systemImage: "map.fill")
-                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                HStack {
+                                    if ownMessage { Spacer(minLength: 64) }
+
+                                    VStack(alignment: ownMessage ? .trailing : .leading, spacing: 4) {
+                                        if !ownMessage {
+                                            Text(message.sender)
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                                .padding(.leading, 8)
                                         }
-                                        .buttonStyle(.plain)
-                                    } else {
-                                        Text(message.text)
-                                            .textSelection(.enabled)
-                                    }
 
-                                    Text(message.date, style: .time)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            if message.kind == .location {
+                                                Button {
+                                                    if chat.preferredMapsApp == .ask {
+                                                        locationToOpen = message
+                                                    } else {
+                                                        chat.openLocation(message)
+                                                    }
+                                                } label: {
+                                                    HStack(spacing: 9) {
+                                                        Image(systemName: "map.fill")
+                                                            .font(.title3)
+                                                        VStack(alignment: .leading, spacing: 2) {
+                                                            Text("Udostępniona lokalizacja")
+                                                                .font(.body.weight(.semibold))
+                                                            Text("Dotknij, aby otworzyć mapę")
+                                                                .font(.caption)
+                                                                .opacity(0.8)
+                                                        }
+                                                    }
+                                                }
+                                                .buttonStyle(.plain)
+                                            } else {
+                                                Text(message.text)
+                                                    .textSelection(.enabled)
+                                            }
+
+                                            Text(message.date, style: .time)
+                                                .font(.caption2)
+                                                .opacity(0.72)
+                                                .frame(maxWidth: .infinity, alignment: .trailing)
+                                        }
+                                        .foregroundStyle(foregroundColor(for: colorIndex))
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 10)
+                                        .background(colors[colorIndex])
+                                        .clipShape(
+                                            UnevenRoundedRectangle(
+                                                topLeadingRadius: 20,
+                                                bottomLeadingRadius: ownMessage ? 20 : 5,
+                                                bottomTrailingRadius: ownMessage ? 5 : 20,
+                                                topTrailingRadius: 20
+                                            )
+                                        )
+                                    }
+                                    .frame(maxWidth: 310, alignment: ownMessage ? .trailing : .leading)
+
+                                    if !ownMessage { Spacer(minLength: 64) }
                                 }
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .glassEffect(.regular, in: .rect(cornerRadius: 18))
+                                .frame(maxWidth: .infinity)
                                 .id(message.id)
                             }
                         }
-                        .padding()
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
                     }
                     .onChange(of: chat.messages.count) {
                         if let id = chat.messages.last?.id {
@@ -146,6 +184,15 @@ struct ChatView: View {
                 }
                 .presentationDetents([.medium])
             }
+        }
+    }
+
+    private func foregroundColor(for colorIndex: Int) -> Color {
+        switch colorIndex {
+        case 2, 3, 5, 7:
+            return .black
+        default:
+            return .white
         }
     }
 }
