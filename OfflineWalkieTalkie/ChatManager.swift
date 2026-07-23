@@ -3,6 +3,14 @@ import Foundation
 import Network
 import UIKit
 
+enum AppMode: String, Codable, CaseIterable, Identifiable {
+    case walkieTalkie = "Walkie-talkie"
+    case call = "Rozmowa"
+    case chat = "Czat"
+
+    var id: Self { self }
+}
+
 struct ChatMessage: Codable, Identifiable, Equatable {
     enum Kind: String, Codable {
         case text
@@ -30,8 +38,27 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published var messages: [ChatMessage] = []
     @Published var connected = false
     @Published var currentLocation: CLLocation?
+    @Published var appMode: AppMode = .walkieTalkie {
+        didSet {
+            guard !applyingRemoteMode else { return }
+            send(ChatPacket(kind: .mode, message: nil, mode: appMode, messages: nil))
+        }
+    }
     @Published var preferredMapsApp: PreferredMapsApp {
         didSet { UserDefaults.standard.set(preferredMapsApp.rawValue, forKey: "preferredMapsApp") }
+    }
+
+    private struct ChatPacket: Codable {
+        enum Kind: String, Codable {
+            case message
+            case mode
+            case history
+        }
+
+        let kind: Kind
+        let message: ChatMessage?
+        let mode: AppMode?
+        let messages: [ChatMessage]?
     }
 
     private let locationManager = CLLocationManager()
@@ -42,6 +69,7 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private var connection: NWConnection?
     private var receivedData = Data()
     private var reconnectTimer: Timer?
+    private var applyingRemoteMode = false
 
     override init() {
         preferredMapsApp = PreferredMapsApp(
@@ -72,7 +100,7 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
             listener?.start(queue: .main)
         } catch {
-            // Czat jest dodatkiem; błąd nie może zatrzymać głównej aplikacji.
+            connected = false
         }
 
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -98,7 +126,8 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     func send(text: String) {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
-        send(ChatMessage(
+
+        let message = ChatMessage(
             id: UUID(),
             sender: UserDefaults.standard.string(forKey: "deviceName") ?? UIDevice.current.name,
             date: Date(),
@@ -106,12 +135,15 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             text: value,
             latitude: nil,
             longitude: nil
-        ))
+        )
+        append(message)
+        send(ChatPacket(kind: .message, message: message, mode: nil, messages: nil))
     }
 
     func sendCurrentLocation() {
         guard let currentLocation else { return }
-        send(ChatMessage(
+
+        let message = ChatMessage(
             id: UUID(),
             sender: UserDefaults.standard.string(forKey: "deviceName") ?? UIDevice.current.name,
             date: Date(),
@@ -119,7 +151,9 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             text: "Udostępniona lokalizacja",
             latitude: currentLocation.coordinate.latitude,
             longitude: currentLocation.coordinate.longitude
-        ))
+        )
+        append(message)
+        send(ChatPacket(kind: .message, message: message, mode: nil, messages: nil))
     }
 
     func openLocation(_ message: ChatMessage, using app: PreferredMapsApp? = nil) {
@@ -127,29 +161,15 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         let selected = app ?? preferredMapsApp
 
         if selected == .google,
-           let url = URL(string: "comgooglemaps://?q=\(latitude),\(longitude)") {
-            if UIApplication.shared.canOpenURL(url) {
-                UIApplication.shared.open(url)
-                return
-            }
+           let url = URL(string: "comgooglemaps://?q=\(latitude),\(longitude)"),
+           UIApplication.shared.canOpenURL(url) {
+            UIApplication.shared.open(url)
+            return
         }
 
         if let url = URL(string: "https://maps.apple.com/?ll=\(latitude),\(longitude)&q=\(latitude),\(longitude)") {
             UIApplication.shared.open(url)
         }
-    }
-
-    private func send(_ message: ChatMessage) {
-        append(message)
-        guard let connection,
-              let payload = try? JSONEncoder().encode(message) else { return }
-
-        var length = UInt32(payload.count).bigEndian
-        var packet = Data(bytes: &length, count: 4)
-        packet.append(payload)
-        connection.send(content: packet, completion: .contentProcessed { [weak self] error in
-            if error != nil { DispatchQueue.main.async { self?.resetConnection() } }
-        })
     }
 
     private func append(_ message: ChatMessage) {
@@ -160,6 +180,18 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         if let data = try? JSONEncoder().encode(messages) {
             UserDefaults.standard.set(data, forKey: "chatMessages")
         }
+    }
+
+    private func send(_ value: ChatPacket) {
+        guard let connection,
+              let payload = try? JSONEncoder().encode(value) else { return }
+
+        var length = UInt32(payload.count).bigEndian
+        var packet = Data(bytes: &length, count: 4)
+        packet.append(payload)
+        connection.send(content: packet, completion: .contentProcessed { [weak self] error in
+            if error != nil { DispatchQueue.main.async { self?.resetConnection() } }
+        })
     }
 
     private func startBrowsing() {
@@ -199,6 +231,8 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
                     self.connected = true
                     self.browser?.cancel()
                     self.browser = nil
+                    self.send(ChatPacket(kind: .mode, message: nil, mode: self.appMode, messages: nil))
+                    self.send(ChatPacket(kind: .history, message: nil, mode: nil, messages: self.messages))
                 case .failed, .cancelled:
                     self.resetConnection()
                 default:
@@ -218,8 +252,20 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
                         guard self.receivedData.count >= 4 + Int(length) else { break }
                         let payload = self.receivedData.subdata(in: 4..<(4 + Int(length)))
                         self.receivedData.removeSubrange(0..<(4 + Int(length)))
-                        if let message = try? JSONDecoder().decode(ChatMessage.self, from: payload) {
-                            DispatchQueue.main.async { self.append(message) }
+
+                        guard let packet = try? JSONDecoder().decode(ChatPacket.self, from: payload) else { continue }
+                        DispatchQueue.main.async {
+                            if let message = packet.message {
+                                self.append(message)
+                            }
+                            if let history = packet.messages {
+                                for message in history { self.append(message) }
+                            }
+                            if let mode = packet.mode {
+                                self.applyingRemoteMode = true
+                                self.appMode = mode
+                                self.applyingRemoteMode = false
+                            }
                         }
                     }
                 }
