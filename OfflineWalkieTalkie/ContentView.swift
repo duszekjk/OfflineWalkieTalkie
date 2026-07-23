@@ -4,6 +4,8 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var walkieTalkie: WalkieTalkie
+    let openChat: () -> Void
+
     @State private var mapPosition: MapCameraPosition = .automatic
     @State private var showColorPicker = false
     @State private var talkButtonOpacity = 1.0
@@ -49,12 +51,21 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 GlassEffectContainer(spacing: 10) {
                     VStack(spacing: 10) {
-                        Picker("Tryb", selection: $walkieTalkie.mode) {
-                            ForEach(CommunicationMode.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
+                        HStack(spacing: 8) {
+                            Picker("Tryb", selection: $walkieTalkie.mode) {
+                                ForEach(CommunicationMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
                             }
+                            .pickerStyle(.segmented)
+
+                            Button(action: openChat) {
+                                Label("Czat", systemImage: "message.fill")
+                                    .labelStyle(.iconOnly)
+                                    .frame(width: 36, height: 36)
+                            }
+                            .buttonStyle(.glass)
                         }
-                        .pickerStyle(.segmented)
                         .padding(6)
                         .glassEffect(.regular.interactive(), in: .capsule)
 
