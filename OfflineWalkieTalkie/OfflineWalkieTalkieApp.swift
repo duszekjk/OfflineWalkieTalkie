@@ -2,35 +2,28 @@ import SwiftUI
 
 @main
 struct OfflineWalkieTalkieApp: App {
-    @Environment(\.scenePhase) private var scenePhase
-    @State private var walkieTalkie: WalkieTalkie? = WalkieTalkie()
-    @State private var chat = ChatManager()
-    @State private var showingChat = false
-    @State private var wasInBackground = false
+    @StateObject private var walkieTalkie = WalkieTalkie()
+    @StateObject private var chat = ChatManager()
 
     var body: some Scene {
         WindowGroup {
-            if showingChat {
-                ChatView {
-                    walkieTalkie = WalkieTalkie()
-                    showingChat = false
+            Group {
+                if chat.appMode == .chat {
+                    ChatView()
+                } else {
+                    ContentView()
                 }
-                .environmentObject(chat)
-            } else if let walkieTalkie {
-                ContentView {
-                    showingChat = true
-                    self.walkieTalkie = nil
-                }
-                .environmentObject(walkieTalkie)
             }
-        }
-        .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .background {
-                wasInBackground = true
-            } else if newPhase == .active, wasInBackground {
-                wasInBackground = false
-                if !showingChat {
-                    walkieTalkie = WalkieTalkie()
+            .environmentObject(walkieTalkie)
+            .environmentObject(chat)
+            .onChange(of: chat.appMode) { _, mode in
+                walkieTalkie.isTalking = false
+                walkieTalkie.callActive = false
+
+                if mode == .walkieTalkie {
+                    walkieTalkie.mode = .walkieTalkie
+                } else if mode == .call {
+                    walkieTalkie.mode = .call
                 }
             }
         }
