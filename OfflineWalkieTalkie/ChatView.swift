@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ChatView: View {
     @EnvironmentObject private var chat: ChatManager
@@ -6,6 +7,7 @@ struct ChatView: View {
     @State private var text = ""
     @State private var locationToOpen: ChatMessage?
     @State private var showSettings = false
+    @State private var showCamera = false
 
     private let colors: [Color] = [.blue, .red, .green, .orange, .purple, .pink, .teal, .yellow]
 
@@ -54,7 +56,15 @@ struct ChatView: View {
                                         }
 
                                         VStack(alignment: .leading, spacing: 6) {
-                                            if message.kind == .location {
+                                            if message.kind == .image,
+                                               let data = message.imageData,
+                                               let image = UIImage(data: data) {
+                                                Image(uiImage: image)
+                                                    .resizable()
+                                                    .scaledToFit()
+                                                    .frame(maxWidth: 280, maxHeight: 320)
+                                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                            } else if message.kind == .location {
                                                 Button {
                                                     if chat.preferredMapsApp == .ask {
                                                         locationToOpen = message
@@ -62,17 +72,7 @@ struct ChatView: View {
                                                         chat.openLocation(message)
                                                     }
                                                 } label: {
-                                                    HStack(spacing: 9) {
-                                                        Image(systemName: "map.fill")
-                                                            .font(.title3)
-                                                        VStack(alignment: .leading, spacing: 2) {
-                                                            Text("Udostępniona lokalizacja")
-                                                                .font(.body.weight(.semibold))
-                                                            Text("Dotknij, aby otworzyć mapę")
-                                                                .font(.caption)
-                                                                .opacity(0.8)
-                                                        }
-                                                    }
+                                                    Label("Otwórz udostępnioną lokalizację", systemImage: "map.fill")
                                                 }
                                                 .buttonStyle(.plain)
                                             } else {
@@ -86,8 +86,7 @@ struct ChatView: View {
                                                 .frame(maxWidth: .infinity, alignment: .trailing)
                                         }
                                         .foregroundStyle(foregroundColor(for: colorIndex))
-                                        .padding(.horizontal, 14)
-                                        .padding(.vertical, 10)
+                                        .padding(message.kind == .image ? 6 : 12)
                                         .background(colors[colorIndex])
                                         .clipShape(
                                             UnevenRoundedRectangle(
@@ -118,13 +117,13 @@ struct ChatView: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        chat.sendCurrentLocation()
+                        showCamera = true
                     } label: {
-                        Image(systemName: "location.fill")
+                        Image(systemName: "camera.fill")
                             .frame(width: 40, height: 40)
                     }
                     .buttonStyle(.glass)
-                    .disabled(chat.currentLocation == nil || !chat.connected)
+                    .disabled(!chat.connected || !UIImagePickerController.isSourceTypeAvailable(.camera))
 
                     TextField("Wiadomość", text: $text, axis: .vertical)
                         .lineLimit(1...4)
@@ -152,6 +151,13 @@ struct ChatView: View {
                         Image(systemName: "gearshape")
                     }
                 }
+            }
+            .sheet(isPresented: $showCamera) {
+                CameraView { image in
+                    chat.send(image: image)
+                    showCamera = false
+                }
+                .ignoresSafeArea()
             }
             .confirmationDialog("Otwórz lokalizację w", isPresented: Binding(
                 get: { locationToOpen != nil },
@@ -193,6 +199,47 @@ struct ChatView: View {
             return .black
         default:
             return .white
+        }
+    }
+}
+
+struct CameraView: UIViewControllerRepresentable {
+    let onPhoto: (UIImage) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPhoto: onPhoto)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.cameraCaptureMode = .photo
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let onPhoto: (UIImage) -> Void
+
+        init(onPhoto: @escaping (UIImage) -> Void) {
+            self.onPhoto = onPhoto
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage {
+                onPhoto(image)
+            } else {
+                picker.dismiss(animated: true)
+            }
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            picker.dismiss(animated: true)
         }
     }
 }
