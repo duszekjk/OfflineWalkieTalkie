@@ -27,6 +27,8 @@
 		<string>_offlinewalkie._tcp</string>
 		<string>_offlinechat._tcp</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Aparat jest używany do robienia zdjęć wysyłanych w czacie.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Aplikacja łączy się bezpośrednio z pobliskimi iPhone’ami.</string>
 	<key>NSMicrophoneUsageDescription</key>
