@@ -16,6 +16,7 @@ struct ChatMessage: Codable, Identifiable, Equatable {
     enum Kind: String, Codable {
         case text
         case location
+        case image
     }
 
     let id: UUID
@@ -25,6 +26,7 @@ struct ChatMessage: Codable, Identifiable, Equatable {
     let text: String
     let latitude: Double?
     let longitude: Double?
+    let imageData: Data?
 }
 
 enum PreferredMapsApp: String, CaseIterable, Identifiable {
@@ -157,23 +159,31 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             kind: .text,
             text: value,
             latitude: nil,
-            longitude: nil
+            longitude: nil,
+            imageData: nil
         )
         append(message)
         send(ChatPacket(kind: .message, message: message, mode: nil, messages: nil))
     }
 
-    func sendCurrentLocation() {
-        guard let currentLocation else { return }
+    func send(image: UIImage) {
+        let longestSide = max(image.size.width, image.size.height)
+        let scale = min(1, 1_600 / longestSide)
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let resized = UIGraphicsImageRenderer(size: size).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        guard let data = resized.jpegData(compressionQuality: 0.72) else { return }
 
         let message = ChatMessage(
             id: UUID(),
             sender: localName,
             date: Date(),
-            kind: .location,
-            text: "Udostępniona lokalizacja",
-            latitude: currentLocation.coordinate.latitude,
-            longitude: currentLocation.coordinate.longitude
+            kind: .image,
+            text: "Zdjęcie",
+            latitude: nil,
+            longitude: nil,
+            imageData: data
         )
         append(message)
         send(ChatPacket(kind: .message, message: message, mode: nil, messages: nil))
@@ -200,7 +210,7 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         guard !messages.contains(where: { $0.id == message.id }) else { return false }
         messages.append(message)
         messages.sort { $0.date < $1.date }
-        if messages.count > 1_000 { messages.removeFirst(messages.count - 1_000) }
+        if messages.count > 300 { messages.removeFirst(messages.count - 300) }
         if let data = try? JSONEncoder().encode(messages) {
             UserDefaults.standard.set(data, forKey: "chatMessages")
         }
@@ -261,7 +271,7 @@ final class ChatManager: NSObject, ObservableObject, CLLocationManagerDelegate {
                     self.browser?.cancel()
                     self.browser = nil
                     self.send(ChatPacket(kind: .mode, message: nil, mode: self.appMode, messages: nil))
-                    self.send(ChatPacket(kind: .history, message: nil, mode: nil, messages: self.messages))
+                    self.send(ChatPacket(kind: .history, message: nil, mode: nil, messages: Array(self.messages.suffix(50))))
                 case .failed, .cancelled:
                     self.resetConnection()
                 default:
